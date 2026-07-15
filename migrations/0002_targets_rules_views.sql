@@ -1,0 +1,6 @@
+ALTER TABLE targets ADD COLUMN rules TEXT NOT NULL DEFAULT '';
+ALTER TABLE targets ADD COLUMN source TEXT NOT NULL DEFAULT 'manual';
+ALTER TABLE targets ADD COLUMN last_seen_at TEXT;
+
+ALTER TABLE messages ADD COLUMN view_count INTEGER;
+ALTER TABLE messages ADD COLUMN batch_id TEXT;

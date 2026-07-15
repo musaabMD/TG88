@@ -5,8 +5,11 @@ Telegram autoposter for channels and groups, built for Cloudflare Workers + D1.
 ## What it does
 
 - Keep a list of Telegram channels/groups.
+- Auto-register groups/channels when the bot receives a webhook update.
 - Schedule messages per channel/group.
+- Bulk schedule multiple messages quickly.
 - Post due messages from a Cloudflare cron trigger.
+- Keep per-target posting rules/notes.
 - Show whether each message is pending, posted, posting, or failed.
 
 ## Cloudflare setup
@@ -38,10 +41,10 @@ npx wrangler d1 migrations apply tg88-db --remote
 npx wrangler secret put TELEGRAM_BOT_TOKEN
 ```
 
-5. Run locally:
+5. Add a webhook secret as a Cloudflare secret:
 
 ```bash
-npm run dev
+npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
 ```
 
 6. Deploy:
@@ -50,8 +53,28 @@ npm run dev
 npm run deploy
 ```
 
+7. Register the Telegram webhook:
+
+```bash
+curl -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
+  -H "content-type: application/json" \
+  --data '{
+    "url": "https://tg88.mousab-r.workers.dev/telegram/webhook",
+    "secret_token": "'"$TELEGRAM_WEBHOOK_SECRET"'",
+    "allowed_updates": ["message", "channel_post", "my_chat_member"]
+  }'
+```
+
+8. Run locally:
+
+```bash
+npm run dev
+```
+
 ## Telegram notes
 
 - Add the bot to each channel or group before scheduling messages.
 - For channels, make the bot an admin with permission to post messages.
 - Use a public channel/group username like `@my_channel`, or the numeric chat ID.
+- Telegram bots cannot fetch a full list of joined groups/channels. To make an existing group appear after the webhook is set, send `/register@dn88appbot` in that group.
+- View counts are shown only when Telegram returns them to the bot API response. For normal bot-sent messages this is often not available.
