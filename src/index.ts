@@ -12,6 +12,8 @@ type Target = {
   id: number;
   title: string;
   chat_id: string;
+  thread_id: number;
+  topic_name: string | null;
   type: "channel" | "group";
   enabled: number;
   rules: string;
@@ -43,11 +45,17 @@ type ScheduledMessage = {
   posted_at: string | null;
   telegram_message_id: number | null;
   view_count: number | null;
+  kind: "text" | "poll";
+  poll_options: string | null;
+  link_preview_enabled: number;
+  repeat_group_id: string | null;
+  repeat_index: number;
   error: string | null;
   created_at: string;
   updated_at: string;
   target_title?: string;
   chat_id?: string;
+  thread_id?: number;
 };
 
 type TargetMetric = {
@@ -70,6 +78,11 @@ type TelegramMessage = {
   message_id: number;
   text?: string;
   chat: TelegramChat;
+  message_thread_id?: number;
+  forum_topic_created?: { name: string };
+  forum_topic_edited?: { name?: string };
+  migrate_to_chat_id?: number;
+  migrate_from_chat_id?: number;
 };
 
 type TelegramUpdate = {
@@ -82,6 +95,9 @@ type TelegramResponse<T = unknown> = {
   ok: boolean;
   result?: T;
   description?: string;
+  parameters?: {
+    migrate_to_chat_id?: number;
+  };
 };
 
 const jsonHeaders = {
@@ -148,53 +164,88 @@ async function telegramWebhook(request: Request, env: Env): Promise<Response> {
   }
 
   const update = await readJson<TelegramUpdate>(request);
-  const chat = update.message?.chat ?? update.channel_post?.chat ?? update.my_chat_member?.chat;
+  const sourceMessage = update.message ?? update.channel_post;
+  const chat = sourceMessage?.chat ?? update.my_chat_member?.chat;
   if (!chat || chat.type === "private") return json({ ok: true });
 
-  const target = await upsertTargetFromChat(chat, env);
-  const text = update.message?.text ?? "";
+  if (sourceMessage?.migrate_to_chat_id) {
+    await migrateChatId(env, String(chat.id), String(sourceMessage.migrate_to_chat_id));
+    return json({ ok: true });
+  }
+
+  const target = await upsertTargetFromChat(chat, sourceMessage, env);
+  const text = sourceMessage?.text ?? "";
   if (text.startsWith("/register")) {
-    await telegramRequest(env, "sendMessage", {
+    const payload: Record<string, unknown> = {
       chat_id: String(chat.id),
       text: `Registered ${target.title} in TG88.`
-    });
+    };
+    if (target.thread_id > 0) payload.message_thread_id = target.thread_id;
+    await telegramRequest(env, "sendMessage", payload);
   }
 
   return json({ ok: true });
 }
 
-async function upsertTargetFromChat(chat: TelegramChat, env: Env): Promise<Target> {
+async function upsertTargetFromChat(chat: TelegramChat, message: TelegramMessage | undefined, env: Env): Promise<Target> {
   const now = new Date().toISOString();
   const chatId = String(chat.id);
-  const title = chat.title ?? chat.username ?? [chat.first_name, chat.last_name].filter(Boolean).join(" ") ?? chatId;
+  const baseTitle = chat.title ?? chat.username ?? [chat.first_name, chat.last_name].filter(Boolean).join(" ") ?? chatId;
+  const rawThreadId = message?.message_thread_id ?? 0;
+  const threadId = rawThreadId === 1 ? 0 : rawThreadId;
+  const topicName = message?.forum_topic_created?.name ?? message?.forum_topic_edited?.name ?? null;
+  const title = threadId > 0 ? `${baseTitle} / ${topicName ?? `Topic ${threadId}`}` : baseTitle;
   const type = chat.type === "channel" ? "channel" : "group";
 
   await env.DB.prepare(
-    `INSERT INTO targets (title, chat_id, type, source, last_seen_at)
-     VALUES (?, ?, ?, 'telegram', ?)
-     ON CONFLICT(chat_id) DO UPDATE SET
+    `INSERT INTO targets (title, chat_id, thread_id, topic_name, type, source, last_seen_at)
+     VALUES (?, ?, ?, ?, ?, 'telegram', ?)
+     ON CONFLICT(chat_id, thread_id) DO UPDATE SET
        title = excluded.title,
+       topic_name = COALESCE(excluded.topic_name, targets.topic_name),
        type = excluded.type,
        source = 'telegram',
        last_seen_at = excluded.last_seen_at`
-  ).bind(title, chatId, type, now).run();
+  ).bind(title, chatId, threadId, topicName, type, now).run();
 
-  const target = await env.DB.prepare("SELECT * FROM targets WHERE chat_id = ?").bind(chatId).first<Target>();
+  const target = await env.DB.prepare("SELECT * FROM targets WHERE chat_id = ? AND thread_id = ?")
+    .bind(chatId, threadId)
+    .first<Target>();
   if (!target) throw new Error("Target registration failed");
   return target;
+}
+
+async function migrateChatId(env: Env, oldChatId: string, newChatId: string): Promise<void> {
+  const existingNew = await env.DB.prepare("SELECT id FROM targets WHERE chat_id = ? AND thread_id = 0")
+    .bind(newChatId)
+    .first<{ id: number }>();
+
+  const oldTarget = await env.DB.prepare("SELECT id FROM targets WHERE chat_id = ? AND thread_id = 0")
+    .bind(oldChatId)
+    .first<{ id: number }>();
+
+  if (existingNew && oldTarget) {
+    await env.DB.prepare("UPDATE messages SET target_id = ? WHERE target_id = ?").bind(existingNew.id, oldTarget.id).run();
+    await env.DB.prepare("UPDATE target_metrics SET target_id = ? WHERE target_id = ?").bind(existingNew.id, oldTarget.id).run();
+    await env.DB.prepare("DELETE FROM targets WHERE id = ?").bind(oldTarget.id).run();
+    return;
+  }
+
+  await env.DB.prepare("UPDATE targets SET chat_id = ? WHERE chat_id = ?").bind(newChatId, oldChatId).run();
 }
 
 async function listTargets(env: Env): Promise<Response> {
   await syncTargetMetrics(env);
 
   const targets = await env.DB.prepare(
-    `SELECT id, title, chat_id, type, enabled, rules, source, last_seen_at, created_at
+    `SELECT id, title, chat_id, thread_id, topic_name, type, enabled, rules, source, last_seen_at, created_at
      FROM targets
+     WHERE enabled = 1
      ORDER BY COALESCE(last_seen_at, created_at) DESC`
   ).all<Target>();
 
   const messages = await env.DB.prepare(
-    `SELECT messages.*, targets.title AS target_title, targets.chat_id
+    `SELECT messages.*, targets.title AS target_title, targets.chat_id, targets.thread_id
      FROM messages
      JOIN targets ON targets.id = messages.target_id
      ORDER BY messages.updated_at DESC
@@ -258,9 +309,9 @@ async function createTarget(request: Request, env: Env): Promise<Response> {
   if (!title || !chatId) return json({ error: "Title and chat ID are required" }, 400);
 
   await env.DB.prepare(
-    `INSERT INTO targets (title, chat_id, type)
-     VALUES (?, ?, ?)
-     ON CONFLICT(chat_id) DO UPDATE SET title = excluded.title, type = excluded.type`
+    `INSERT INTO targets (title, chat_id, thread_id, type)
+     VALUES (?, ?, 0, ?)
+     ON CONFLICT(chat_id, thread_id) DO UPDATE SET title = excluded.title, type = excluded.type`
   ).bind(title, chatId, type).run();
 
   return listTargets(env);
@@ -288,14 +339,14 @@ async function deleteTarget(id: number, env: Env): Promise<Response> {
 async function listMessages(env: Env, targetId?: number): Promise<Response> {
   const query = targetId
     ? env.DB.prepare(
-        `SELECT messages.*, targets.title AS target_title, targets.chat_id
+        `SELECT messages.*, targets.title AS target_title, targets.chat_id, targets.thread_id
          FROM messages
          JOIN targets ON targets.id = messages.target_id
          WHERE messages.target_id = ?
          ORDER BY messages.updated_at DESC`
       ).bind(targetId)
     : env.DB.prepare(
-        `SELECT messages.*, targets.title AS target_title, targets.chat_id
+        `SELECT messages.*, targets.title AS target_title, targets.chat_id, targets.thread_id
          FROM messages
          JOIN targets ON targets.id = messages.target_id
          ORDER BY messages.updated_at DESC
@@ -306,18 +357,100 @@ async function listMessages(env: Env, targetId?: number): Promise<Response> {
   return json({ messages: messages.results ?? [] });
 }
 
+type PostInput = {
+  targetId?: number;
+  body?: string;
+  scheduledAt?: string;
+  kind?: string;
+  pollOptions?: string[];
+  linkPreviewEnabled?: boolean;
+  repeatCount?: number;
+  repeatIntervalMinutes?: number;
+};
+
+type NormalizedPostInput = {
+  body: string;
+  kind: "text" | "poll";
+  pollOptionsJson: string | null;
+  linkPreviewEnabled: boolean;
+  repeatCount: number;
+  repeatIntervalMinutes: number;
+  repeatGroupId: string | null;
+};
+
+function normalizePostInput(input: PostInput): NormalizedPostInput {
+  const kind = input.kind === "poll" ? "poll" : "text";
+  const pollOptions = (input.pollOptions ?? [])
+    .map((option) => cleanText(option, 100))
+    .filter(Boolean)
+    .slice(0, 10);
+  const body = cleanText(input.body, kind === "poll" ? 300 : 4096);
+  const repeatCount = Math.max(1, Math.min(30, Math.floor(Number(input.repeatCount ?? 1))));
+  const repeatIntervalMinutes = Math.max(1, Math.min(43200, Math.floor(Number(input.repeatIntervalMinutes ?? 1440))));
+
+  return {
+    body,
+    kind,
+    pollOptionsJson: kind === "poll" ? JSON.stringify(pollOptions) : null,
+    linkPreviewEnabled: input.linkPreviewEnabled !== false,
+    repeatCount,
+    repeatIntervalMinutes,
+    repeatGroupId: repeatCount > 1 ? crypto.randomUUID() : null
+  };
+}
+
+function validatePostInput(input: NormalizedPostInput): string | null {
+  if (!input.body) return "Write a post first";
+  if (input.kind === "poll") {
+    const options = parsePollOptions(input.pollOptionsJson);
+    if (options.length < 2) return "Poll needs at least two options";
+  }
+  return null;
+}
+
+function parsePollOptions(value: string | null): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.map((option) => cleanText(option, 100)).filter(Boolean).slice(0, 10) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function insertRepeatedMessages(
+  env: Env,
+  targetId: number,
+  draft: NormalizedPostInput,
+  firstScheduledAt: string,
+  status: MessageStatus
+): Promise<void> {
+  const validationError = validatePostInput(draft);
+  if (validationError) throw new Error(validationError);
+
+  const start = new Date(firstScheduledAt).getTime();
+  const batchId = crypto.randomUUID();
+  for (let index = 0; index < draft.repeatCount; index += 1) {
+    const scheduledAt = new Date(start + index * draft.repeatIntervalMinutes * 60_000).toISOString();
+    await insertMessage(env, targetId, draft, scheduledAt, status, batchId, index);
+  }
+}
+
 async function createMessage(request: Request, env: Env): Promise<Response> {
-  const input = await readJson<{ targetId?: number; body?: string; scheduledAt?: string }>(request);
-  const body = cleanText(input.body, 4096);
+  const input = await readJson<PostInput>(request);
+  const draft = normalizePostInput(input);
   const scheduledAt = normalizeDate(input.scheduledAt);
 
-  if (!input.targetId || !body || !scheduledAt) {
+  if (!input.targetId || !draft.body || !scheduledAt) {
     return json({ error: "Target, message, and schedule time are required" }, 400);
   }
 
   if (!(await targetExists(env, input.targetId))) return json({ error: "Target not found" }, 404);
 
-  await insertMessage(env, input.targetId, body, scheduledAt, "pending");
+  const validationError = validatePostInput(draft);
+  if (validationError) return json({ error: validationError }, 400);
+
+  await insertRepeatedMessages(env, input.targetId, draft, scheduledAt, "pending");
   return listTargets(env);
 }
 
@@ -342,24 +475,42 @@ async function createBulkMessages(request: Request, env: Env): Promise<Response>
   const batchId = crypto.randomUUID();
   for (let index = 0; index < bodies.length; index += 1) {
     const scheduledAt = new Date(start + index * spacingMinutes * 60_000).toISOString();
-    await insertMessage(env, input.targetId, bodies[index], scheduledAt, "pending", batchId);
+    await insertMessage(
+      env,
+      input.targetId,
+      {
+        body: bodies[index],
+        kind: "text",
+        pollOptionsJson: null,
+        linkPreviewEnabled: true,
+        repeatCount: 1,
+        repeatIntervalMinutes: 0,
+        repeatGroupId: null
+      },
+      scheduledAt,
+      "pending",
+      batchId
+    );
   }
 
   return listTargets(env);
 }
 
 async function saveDraft(request: Request, env: Env): Promise<Response> {
-  const input = await readJson<{ targetId?: number; body?: string; draftId?: number }>(request);
-  const body = cleanText(input.body, 4096);
+  const input = await readJson<PostInput & { draftId?: number }>(request);
+  const draftInput = normalizePostInput(input);
   const now = new Date().toISOString();
 
   if (!input.targetId) return json({ error: "Target is required" }, 400);
   if (!(await targetExists(env, input.targetId))) return json({ error: "Target not found" }, 404);
 
-  if (!body) {
+  if (!draftInput.body) {
     if (input.draftId) await env.DB.prepare("DELETE FROM messages WHERE id = ? AND status = 'draft'").bind(input.draftId).run();
     return json({ draft: null });
   }
+
+  const validationError = validatePostInput(draftInput);
+  if (validationError) return json({ error: validationError }, 400);
 
   const existing = input.draftId
     ? await env.DB.prepare("SELECT * FROM messages WHERE id = ? AND target_id = ? AND status = 'draft'")
@@ -368,14 +519,26 @@ async function saveDraft(request: Request, env: Env): Promise<Response> {
     : null;
 
   if (existing) {
-    await env.DB.prepare("UPDATE messages SET body = ?, scheduled_at = ?, updated_at = ? WHERE id = ?")
-      .bind(body, now, now, existing.id)
+    await env.DB.prepare(
+      `UPDATE messages
+       SET body = ?, scheduled_at = ?, kind = ?, poll_options = ?, link_preview_enabled = ?, updated_at = ?
+       WHERE id = ?`
+    )
+      .bind(
+        draftInput.body,
+        now,
+        draftInput.kind,
+        draftInput.pollOptionsJson,
+        draftInput.linkPreviewEnabled ? 1 : 0,
+        now,
+        existing.id
+      )
       .run();
     const draft = await env.DB.prepare("SELECT * FROM messages WHERE id = ?").bind(existing.id).first<ScheduledMessage>();
     return json({ draft });
   }
 
-  await insertMessage(env, input.targetId, body, now, "draft");
+  await insertRepeatedMessages(env, input.targetId, draftInput, now, "draft");
   const draft = await env.DB.prepare(
     "SELECT * FROM messages WHERE target_id = ? AND status = 'draft' ORDER BY id DESC LIMIT 1"
   ).bind(input.targetId).first<ScheduledMessage>();
@@ -403,13 +566,38 @@ async function publishDraft(id: number, env: Env): Promise<Response> {
 async function insertMessage(
   env: Env,
   targetId: number,
-  body: string,
+  draft: NormalizedPostInput,
   scheduledAt: string,
   status: MessageStatus,
-  batchId: string | null = null
+  batchId: string | null = null,
+  repeatIndex = 0
 ): Promise<void> {
-  await env.DB.prepare("INSERT INTO messages (target_id, body, scheduled_at, status, batch_id) VALUES (?, ?, ?, ?, ?)")
-    .bind(targetId, body, scheduledAt, status, batchId)
+  await env.DB.prepare(
+    `INSERT INTO messages (
+      target_id,
+      body,
+      scheduled_at,
+      status,
+      batch_id,
+      kind,
+      poll_options,
+      link_preview_enabled,
+      repeat_group_id,
+      repeat_index
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      targetId,
+      draft.body,
+      scheduledAt,
+      status,
+      batchId,
+      draft.kind,
+      draft.pollOptionsJson,
+      draft.linkPreviewEnabled ? 1 : 0,
+      draft.repeatGroupId,
+      repeatIndex
+    )
     .run();
 }
 
@@ -427,7 +615,7 @@ async function deleteMessage(id: number, env: Env): Promise<Response> {
 
 async function postOneMessage(id: number, env: Env): Promise<Response> {
   const message = await env.DB.prepare(
-    `SELECT messages.*, targets.chat_id, targets.title AS target_title
+    `SELECT messages.*, targets.chat_id, targets.thread_id, targets.title AS target_title
      FROM messages
      JOIN targets ON targets.id = messages.target_id
      WHERE messages.id = ?`
@@ -443,7 +631,7 @@ async function postOneMessage(id: number, env: Env): Promise<Response> {
 async function postDueMessages(env: Env): Promise<void> {
   const now = new Date().toISOString();
   const due = await env.DB.prepare(
-    `SELECT messages.*, targets.chat_id, targets.title AS target_title
+    `SELECT messages.*, targets.chat_id, targets.thread_id, targets.title AS target_title
      FROM messages
      JOIN targets ON targets.id = messages.target_id
      WHERE messages.status = 'pending'
@@ -465,11 +653,7 @@ async function sendAndRecord(message: ScheduledMessage, env: Env): Promise<void>
 
   if (claimed.meta.changes === 0) return;
 
-  const sent = await telegramRequest<{ message_id: number; views?: number }>(env, "sendMessage", {
-    chat_id: message.chat_id,
-    text: message.body,
-    disable_web_page_preview: false
-  });
+  const sent = await sendTelegramPost(env, message);
 
   const now = new Date().toISOString();
   if (sent.ok && sent.result?.message_id) {
@@ -487,6 +671,34 @@ async function sendAndRecord(message: ScheduledMessage, env: Env): Promise<void>
      SET status = 'failed', error = ?, updated_at = ?
      WHERE id = ?`
   ).bind(sent.description ?? "Telegram send failed", now, message.id).run();
+
+  if (sent.parameters?.migrate_to_chat_id && message.chat_id) {
+    await migrateChatId(env, message.chat_id, String(sent.parameters.migrate_to_chat_id));
+  }
+}
+
+async function sendTelegramPost(env: Env, message: ScheduledMessage): Promise<TelegramResponse<{ message_id: number; views?: number }>> {
+  const basePayload: Record<string, unknown> = {
+    chat_id: message.chat_id
+  };
+  if ((message.thread_id ?? 0) > 1) basePayload.message_thread_id = message.thread_id;
+
+  if (message.kind === "poll") {
+    return telegramRequest(env, "sendPoll", {
+      ...basePayload,
+      question: message.body,
+      options: parsePollOptions(message.poll_options),
+      is_anonymous: false
+    });
+  }
+
+  return telegramRequest(env, "sendMessage", {
+    ...basePayload,
+    text: message.body,
+    link_preview_options: {
+      is_disabled: message.link_preview_enabled === 0
+    }
+  });
 }
 
 async function syncTargetMetrics(env: Env): Promise<void> {

@@ -42,6 +42,8 @@ type Page = "post" | "posts" | "channels" | "analytics";
 interface ApiTarget {
   id: number;
   chat_id: string;
+  thread_id: number;
+  topic_name: string | null;
   title: string;
   type: ChannelKind;
   rules: string;
@@ -62,6 +64,11 @@ interface ApiMessage {
   id: number;
   target_id: number;
   body: string;
+  kind: "text" | "poll";
+  poll_options: string | null;
+  link_preview_enabled: number;
+  repeat_group_id: string | null;
+  repeat_index: number;
   status: "draft" | "pending" | "posting" | "posted" | "failed";
   scheduled_at: string;
   posted_at: string | null;
@@ -86,6 +93,8 @@ interface Post {
   id: string;
   channelId: string;
   text: string;
+  kind: "text" | "poll";
+  pollOptions: string[];
   status: PostStatus;
   publishedAt: string | null;
   views: number;
@@ -245,6 +254,8 @@ function mapData(targets: ApiTarget[]): { channels: Channel[]; posts: Post[] } {
       id: String(message.id),
       channelId: String(target.id),
       text: message.body,
+      kind: message.kind ?? "text",
+      pollOptions: parseOptions(message.poll_options),
       status: normalizeStatus(message.status),
       publishedAt: message.posted_at,
       views: message.view_count ?? 0,
@@ -253,6 +264,16 @@ function mapData(targets: ApiTarget[]): { channels: Channel[]; posts: Post[] } {
   );
 
   return { channels, posts };
+}
+
+function parseOptions(value: string | null): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch {
+    return [];
+  }
 }
 
 function normalizeHistory(history: number[] | undefined, fallback: number): number[] {
@@ -315,12 +336,20 @@ function SideNav({ page, setPage, draftCount }: { page: Page; setPage: (p: Page)
 
 function Composer({
   channels,
-  onDraft
+  onDraft,
+  onSchedule
 }: {
   channels: Channel[];
-  onDraft: (text: string, channelIds: string[]) => void;
+  onDraft: (payload: ComposerPayload, channelIds: string[]) => void;
+  onSchedule: (payload: ComposerPayload, channelIds: string[]) => void;
 }) {
   const [text, setText] = useState("");
+  const [mode, setMode] = useState<"text" | "poll">("text");
+  const [pollOptions, setPollOptions] = useState("Yes\nNo");
+  const [linkPreviewEnabled, setLinkPreviewEnabled] = useState(true);
+  const [repeatCount, setRepeatCount] = useState(1);
+  const [repeatIntervalMinutes, setRepeatIntervalMinutes] = useState(1440);
+  const [scheduledAt, setScheduledAt] = useState(defaultScheduleTime());
   const [selected, setSelected] = useState<string[]>([]);
   const taRef = useRef<HTMLTextAreaElement>(null);
 
@@ -332,16 +361,48 @@ function Composer({
   }, [channels]);
 
   const toggle = (id: string) => setSelected((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
-  const canSubmit = text.trim().length > 0 && selected.length > 0;
-  const submit = () => {
-    if (!canSubmit) return;
-    onDraft(text.trim(), selected);
+  const normalizedPollOptions = pollOptions.split("\n").map((option) => option.trim()).filter(Boolean);
+  const canSubmit = text.trim().length > 0 && selected.length > 0 && (mode === "text" || normalizedPollOptions.length >= 2);
+  const payload = (): ComposerPayload => ({
+    body: text.trim(),
+    kind: mode,
+    pollOptions: normalizedPollOptions,
+    linkPreviewEnabled,
+    repeatCount,
+    repeatIntervalMinutes,
+    scheduledAt
+  });
+  const clear = () => {
     setText("");
     taRef.current?.focus();
+  };
+  const submit = () => {
+    if (!canSubmit) return;
+    onDraft(payload(), selected);
+    clear();
+  };
+  const schedule = () => {
+    if (!canSubmit) return;
+    onSchedule(payload(), selected);
+    clear();
   };
 
   return (
     <Card className="p-5">
+      <div className="flex items-center gap-2 mb-3">
+        <button
+          onClick={() => setMode("text")}
+          className={`h-8 px-3 rounded-lg text-xs font-medium ${mode === "text" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-100"}`}
+        >
+          Post
+        </button>
+        <button
+          onClick={() => setMode("poll")}
+          className={`h-8 px-3 rounded-lg text-xs font-medium ${mode === "poll" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-100"}`}
+        >
+          Poll
+        </button>
+      </div>
       <textarea
         ref={taRef}
         value={text}
@@ -352,10 +413,22 @@ function Composer({
             submit();
           }
         }}
-        placeholder="What is happening?"
+        placeholder={mode === "poll" ? "Poll question" : "What is happening?"}
         rows={3}
         className="w-full resize-none text-lg text-slate-900 placeholder:text-slate-400 focus:outline-none"
       />
+
+      {mode === "poll" && (
+        <div className="mt-3">
+          <label className="text-xs font-medium text-slate-500">Poll options, one per line</label>
+          <textarea
+            value={pollOptions}
+            onChange={(event) => setPollOptions(event.target.value)}
+            rows={4}
+            className="mt-2 w-full rounded-lg border border-slate-300 p-3 text-sm text-slate-800 focus:outline-2 focus:outline-sky-500 resize-none"
+          />
+        </div>
+      )}
 
       <div className="flex flex-wrap items-center gap-2 mt-3">
         {channels.map((c) => {
@@ -377,20 +450,87 @@ function Composer({
         })}
       </div>
 
-      <div className="flex flex-wrap items-center justify-between gap-3 mt-4 pt-4 border-t border-slate-100">
-        <div className="flex items-center gap-2 text-xs text-slate-500">
-          <CornerDownLeft className="w-3.5 h-3.5" />
-          <span>
-            Enter drafts to {selected.length} chat{selected.length === 1 ? "" : "s"} · publish from the Posts page
-          </span>
+      <div className="mt-4 pt-4 border-t border-slate-100 space-y-3">
+        <div className="grid grid-cols-1 lg:grid-cols-4 gap-3">
+          <label className="text-xs text-slate-500">
+            Schedule
+            <input
+              type="datetime-local"
+              value={scheduledAt}
+              onChange={(event) => setScheduledAt(event.target.value)}
+              className="mt-1 w-full rounded-lg border border-slate-300 px-3 h-9 text-sm text-slate-700"
+            />
+          </label>
+          <label className="text-xs text-slate-500">
+            Repeat
+            <input
+              type="number"
+              min={1}
+              max={30}
+              value={repeatCount}
+              onChange={(event) => setRepeatCount(Number(event.target.value))}
+              className="mt-1 w-full rounded-lg border border-slate-300 px-3 h-9 text-sm text-slate-700"
+            />
+          </label>
+          <label className="text-xs text-slate-500">
+            Every minutes
+            <input
+              type="number"
+              min={1}
+              max={43200}
+              value={repeatIntervalMinutes}
+              onChange={(event) => setRepeatIntervalMinutes(Number(event.target.value))}
+              className="mt-1 w-full rounded-lg border border-slate-300 px-3 h-9 text-sm text-slate-700"
+            />
+          </label>
+          <label className="flex items-end gap-2 text-xs text-slate-500 pb-2">
+            <input
+              type="checkbox"
+              checked={linkPreviewEnabled}
+              onChange={(event) => setLinkPreviewEnabled(event.target.checked)}
+              disabled={mode === "poll"}
+              className="accent-slate-900 w-4 h-4"
+            />
+            Link preview
+          </label>
         </div>
-        <Button disabled={!canSubmit} onClick={submit}>
-          <PenLine className="w-4 h-4" />
-          Save draft
-        </Button>
+
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2 text-xs text-slate-500">
+            <CornerDownLeft className="w-3.5 h-3.5" />
+            <span>
+              Enter drafts to {selected.length} chat{selected.length === 1 ? "" : "s"} · links work inside text posts
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <Button disabled={!canSubmit} variant="outline" onClick={schedule}>
+              <Send className="w-4 h-4" />
+              Schedule
+            </Button>
+            <Button disabled={!canSubmit} onClick={submit}>
+              <PenLine className="w-4 h-4" />
+              Save draft
+            </Button>
+          </div>
+        </div>
       </div>
     </Card>
   );
+}
+
+type ComposerPayload = {
+  body: string;
+  kind: "text" | "poll";
+  pollOptions: string[];
+  linkPreviewEnabled: boolean;
+  repeatCount: number;
+  repeatIntervalMinutes: number;
+  scheduledAt: string;
+};
+
+function defaultScheduleTime(): string {
+  const date = new Date(Date.now() + 10 * 60 * 1000);
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
 }
 
 function StatCard({ label, value, sub, icon }: { label: string; value: string; sub: string; icon: React.ReactNode }) {
@@ -406,7 +546,17 @@ function StatCard({ label, value, sub, icon }: { label: string; value: string; s
   );
 }
 
-function PostPage({ channels, posts, onDraft }: { channels: Channel[]; posts: Post[]; onDraft: (text: string, ids: string[]) => void }) {
+function PostPage({
+  channels,
+  posts,
+  onDraft,
+  onSchedule
+}: {
+  channels: Channel[];
+  posts: Post[];
+  onDraft: (payload: ComposerPayload, ids: string[]) => void;
+  onSchedule: (payload: ComposerPayload, ids: string[]) => void;
+}) {
   const totalMembers = channels.reduce((s, c) => s + c.members, 0);
   const overallHistory = channels.length
     ? channels[0].memberHistory.map((_, i) => channels.reduce((s, c) => s + (c.memberHistory[i] ?? 0), 0))
@@ -418,7 +568,7 @@ function PostPage({ channels, posts, onDraft }: { channels: Channel[]; posts: Po
 
   return (
     <div className="space-y-5">
-      <Composer channels={channels} onDraft={onDraft} />
+      <Composer channels={channels} onDraft={onDraft} onSchedule={onSchedule} />
 
       <div className="grid grid-cols-2 xl:grid-cols-4 gap-4">
         <StatCard label="Members" value={totalMembers.toLocaleString()} sub={`${growth >= 0 ? "+" : ""}${growth.toFixed(1)}% this week · target ${GROWTH_TARGET}%`} icon={<Users className="w-3.5 h-3.5" />} />
@@ -539,6 +689,15 @@ function PostsPage({
                   </span>
                 </div>
                 <p className="text-[15px] text-slate-800 leading-snug mt-1.5 break-words">{p.text}</p>
+                {p.kind === "poll" && (
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {p.pollOptions.map((option) => (
+                      <span key={option} className="px-2 py-1 rounded-full bg-slate-100 text-[11px] text-slate-600">
+                        {option}
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
             </label>
           );
@@ -803,17 +962,30 @@ function TG88Dashboard() {
     });
   }, [load, notify]);
 
-  const draftPosts = async (text: string, channelIds: string[]) => {
+  const draftPosts = async (payload: ComposerPayload, channelIds: string[]) => {
     await Promise.all(
       channelIds.map((channelId) =>
         api("/api/drafts", {
           method: "PUT",
-          body: JSON.stringify({ targetId: Number(channelId), body: text })
+          body: JSON.stringify({ targetId: Number(channelId), ...payload })
         })
       )
     );
     await load();
     notify(`Drafted to ${channelIds.length} chat${channelIds.length === 1 ? "" : "s"}`);
+  };
+
+  const schedulePosts = async (payload: ComposerPayload, channelIds: string[]) => {
+    await Promise.all(
+      channelIds.map((channelId) =>
+        api("/api/messages", {
+          method: "POST",
+          body: JSON.stringify({ targetId: Number(channelId), ...payload, scheduledAt: payload.scheduledAt })
+        })
+      )
+    );
+    await load();
+    notify(`Scheduled to ${channelIds.length} chat${channelIds.length === 1 ? "" : "s"}`);
   };
 
   const publishPosts = async (ids: string[]) => {
@@ -871,7 +1043,7 @@ function TG88Dashboard() {
         <main className="p-6 max-w-6xl">
           {loading && <Card className="p-10 text-center text-sm text-slate-500">Loading TG88...</Card>}
           {!loading && channels.length === 0 && <Card className="p-10 text-center text-sm text-slate-500">Use /register@dn88appbot in Telegram to add chats.</Card>}
-          {!loading && channels.length > 0 && page === "post" && <PostPage channels={channels} posts={posts} onDraft={draftPosts} />}
+          {!loading && channels.length > 0 && page === "post" && <PostPage channels={channels} posts={posts} onDraft={draftPosts} onSchedule={schedulePosts} />}
           {!loading && channels.length > 0 && page === "posts" && <PostsPage posts={posts} channels={channels} onPublish={publishPosts} onDelete={deletePosts} />}
           {!loading && channels.length > 0 && page === "channels" && <ChannelsPage channels={channels} posts={posts} onOpenRules={setRulesFor} />}
           {!loading && channels.length > 0 && page === "analytics" && <AnalyticsPage channels={channels} />}
