@@ -4,13 +4,23 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "build:ui": "node scripts/build-ui.mjs",
     "dev": "wrangler dev --test-scheduled --local",
-    "deploy": "wrangler deploy",
+    "deploy": "npm run build:ui && wrangler deploy",
     "check": "tsc --noEmit",
     "cf:types": "wrangler types"
   },
+  "dependencies": {
+    "lucide-react": "^0.562.0",
+    "react": "^19.2.2",
+    "react-dom": "^19.2.2",
+    "recharts": "^3.6.0"
+  },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260715.1",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "esbuild": "^0.28.1",
     "typescript": "^7.0.2",
     "wrangler": "^4.111.0"
   }
