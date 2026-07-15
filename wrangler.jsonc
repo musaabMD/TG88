@@ -1,0 +1,20 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "tg88",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-15",
+  "observability": {
+    "enabled": true
+  },
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "tg88-db",
+      "database_id": "312eb286-cc98-40a2-88cd-24742ba37d36",
+      "migrations_dir": "migrations"
+    }
+  ]
+}

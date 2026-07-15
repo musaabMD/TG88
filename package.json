@@ -1,0 +1,17 @@
+{
+  "name": "tg88",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --test-scheduled --local",
+    "deploy": "wrangler deploy",
+    "check": "tsc --noEmit",
+    "cf:types": "wrangler types"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260715.1",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.111.0"
+  }
+}
