@@ -4,6 +4,8 @@ interface Env {
   DB: D1Database;
   TELEGRAM_BOT_TOKEN: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
+  OPENROUTER_API_KEY?: string;
+  OPENROUTER_MODEL?: string;
 }
 
 type MessageStatus = "draft" | "pending" | "posting" | "posted" | "failed";
@@ -100,6 +102,19 @@ type TelegramResponse<T = unknown> = {
   };
 };
 
+type AiGeneration = {
+  id: number;
+  prompt: string;
+  target_ids: string;
+  desired_count: number;
+  batch_size: number;
+  generated_count: number;
+  model: string;
+  previous_outputs: string;
+  created_at: string;
+  updated_at: string;
+};
+
 const jsonHeaders = {
   "content-type": "application/json; charset=utf-8",
   "cache-control": "no-store"
@@ -129,6 +144,10 @@ export default {
     if (url.pathname === "/api/messages" && request.method === "POST") return createMessage(request, env);
     if (url.pathname === "/api/messages/bulk" && request.method === "POST") return createBulkMessages(request, env);
     if (url.pathname === "/api/drafts" && request.method === "PUT") return saveDraft(request, env);
+    if (url.pathname === "/api/ai/generations" && request.method === "POST") return createAiGeneration(request, env);
+
+    const aiContinueMatch = url.pathname.match(/^\/api\/ai\/generations\/(\d+)\/continue$/);
+    if (aiContinueMatch && request.method === "POST") return continueAiGeneration(Number(aiContinueMatch[1]), env);
 
     const draftScheduleMatch = url.pathname.match(/^\/api\/drafts\/(\d+)\/schedule$/);
     if (draftScheduleMatch && request.method === "POST") return scheduleDraft(Number(draftScheduleMatch[1]), request, env);
@@ -545,6 +564,169 @@ async function saveDraft(request: Request, env: Env): Promise<Response> {
   return json({ draft });
 }
 
+async function createAiGeneration(request: Request, env: Env): Promise<Response> {
+  const input = await readJson<{
+    prompt?: string;
+    targetIds?: number[];
+    desiredCount?: number;
+    batchSize?: number;
+    model?: string;
+  }>(request);
+
+  const prompt = cleanText(input.prompt, 12000);
+  const targetIds = sanitizeTargetIds(input.targetIds);
+  const desiredCount = Math.max(3, Math.min(500, Math.floor(Number(input.desiredCount ?? 100))));
+  const batchSize = Math.max(1, Math.min(10, Math.floor(Number(input.batchSize ?? 3))));
+  const model = cleanText(input.model, 120) || env.OPENROUTER_MODEL || "~openai/gpt-latest";
+
+  if (!prompt) return json({ error: "Prompt is required" }, 400);
+  if (targetIds.length === 0) return json({ error: "Choose at least one channel or group" }, 400);
+  if (!(await targetsExist(env, targetIds))) return json({ error: "One or more selected chats no longer exist" }, 400);
+
+  const now = new Date().toISOString();
+  const created = await env.DB.prepare(
+    `INSERT INTO ai_generations (prompt, target_ids, desired_count, batch_size, model, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).bind(prompt, JSON.stringify(targetIds), desiredCount, batchSize, model, now).run();
+
+  const id = Number(created.meta.last_row_id);
+  return runAiGenerationBatch(id, env);
+}
+
+async function continueAiGeneration(id: number, env: Env): Promise<Response> {
+  return runAiGenerationBatch(id, env);
+}
+
+async function runAiGenerationBatch(id: number, env: Env): Promise<Response> {
+  try {
+    const generation = await env.DB.prepare("SELECT * FROM ai_generations WHERE id = ?")
+      .bind(id)
+      .first<AiGeneration>();
+
+    if (!generation) return json({ error: "Generation not found" }, 404);
+    if (generation.generated_count >= generation.desired_count) {
+      return json({ generation, posts: [], done: true });
+    }
+
+    const targetIds = parseNumberArray(generation.target_ids);
+    const previousOutputs = parseStringArray(generation.previous_outputs);
+    const remaining = Math.max(0, generation.desired_count - generation.generated_count);
+    const count = Math.min(generation.batch_size, remaining);
+    const targets = await getTargetsByIds(env, targetIds);
+    const generated = await generatePostsWithOpenRouter(env, generation, targets, previousOutputs, count);
+
+    const now = new Date().toISOString();
+    for (const targetId of targetIds) {
+      for (const text of generated) {
+        await insertMessage(
+          env,
+          targetId,
+          {
+            body: text,
+            kind: "text",
+            pollOptionsJson: null,
+            linkPreviewEnabled: true,
+            repeatCount: 1,
+            repeatIntervalMinutes: 1440,
+            repeatGroupId: null
+          },
+          now,
+          "draft"
+        );
+      }
+    }
+
+    const nextOutputs = [...previousOutputs, ...generated].slice(-80);
+    const nextCount = generation.generated_count + generated.length;
+    await env.DB.prepare(
+      `UPDATE ai_generations
+       SET generated_count = ?, previous_outputs = ?, updated_at = ?
+       WHERE id = ?`
+    ).bind(nextCount, JSON.stringify(nextOutputs), now, id).run();
+
+    const updated = await env.DB.prepare("SELECT * FROM ai_generations WHERE id = ?").bind(id).first<AiGeneration>();
+    return json({ generation: updated, posts: generated, done: nextCount >= generation.desired_count });
+  } catch (error) {
+    return json({ error: error instanceof Error ? error.message : "AI generation failed" }, 502);
+  }
+}
+
+async function generatePostsWithOpenRouter(
+  env: Env,
+  generation: AiGeneration,
+  targets: Target[],
+  previousOutputs: string[],
+  count: number
+): Promise<string[]> {
+  if (!env.OPENROUTER_API_KEY) {
+    throw new Error("OPENROUTER_API_KEY is not configured");
+  }
+
+  const targetContext = targets.map((target) => ({
+    title: target.title,
+    chat_id: target.chat_id,
+    topic: target.topic_name,
+    rules: target.rules
+  }));
+
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
+      "content-type": "application/json",
+      "http-referer": "https://tg88.mousab-r.workers.dev",
+      "x-openrouter-title": "TG88"
+    },
+    body: JSON.stringify({
+      model: generation.model,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You write concise Telegram posts. Return only valid JSON matching {\"posts\":[{\"text\":\"...\"}]}. No markdown. No explanations. Each post must be distinct, ready to publish, and under 900 characters."
+        },
+        {
+          role: "user",
+          content: JSON.stringify({
+            task: `Generate exactly ${count} new Telegram posts.`,
+            prompt: generation.prompt,
+            target_chats: targetContext,
+            previous_posts_to_avoid: previousOutputs.slice(-30)
+          })
+        }
+      ],
+      temperature: 0.85,
+      response_format: { type: "json_object" }
+    })
+  });
+
+  const data = (await response.json()) as {
+    choices?: { message?: { content?: string } }[];
+    error?: { message?: string };
+  };
+
+  if (!response.ok) {
+    throw new Error(data.error?.message ?? "OpenRouter request failed");
+  }
+
+  const content = data.choices?.[0]?.message?.content ?? "";
+  const parsed = parseGeneratedPosts(content);
+  if (parsed.length === 0) throw new Error("OpenRouter returned no posts");
+  return parsed.slice(0, count);
+}
+
+function parseGeneratedPosts(content: string): string[] {
+  try {
+    const parsed = JSON.parse(content);
+    const posts = Array.isArray(parsed.posts) ? parsed.posts : [];
+    return posts
+      .map((post: { text?: unknown }) => cleanText(post.text, 900))
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
 async function scheduleDraft(id: number, request: Request, env: Env): Promise<Response> {
   const input = await readJson<{ scheduledAt?: string }>(request);
   const scheduledAt = normalizeDate(input.scheduledAt);
@@ -606,6 +788,48 @@ async function targetExists(env: Env, targetId: number): Promise<boolean> {
     .bind(targetId)
     .first<{ id: number }>();
   return Boolean(target);
+}
+
+async function targetsExist(env: Env, targetIds: number[]): Promise<boolean> {
+  if (targetIds.length === 0) return false;
+  const placeholders = targetIds.map(() => "?").join(",");
+  const result = await env.DB.prepare(
+    `SELECT COUNT(*) AS count FROM targets WHERE enabled = 1 AND id IN (${placeholders})`
+  ).bind(...targetIds).first<{ count: number }>();
+  return result?.count === targetIds.length;
+}
+
+async function getTargetsByIds(env: Env, targetIds: number[]): Promise<Target[]> {
+  if (targetIds.length === 0) return [];
+  const placeholders = targetIds.map(() => "?").join(",");
+  const targets = await env.DB.prepare(
+    `SELECT id, title, chat_id, thread_id, topic_name, type, enabled, rules, source, last_seen_at, created_at
+     FROM targets
+     WHERE enabled = 1 AND id IN (${placeholders})`
+  ).bind(...targetIds).all<Target>();
+  return targets.results ?? [];
+}
+
+function sanitizeTargetIds(value: unknown): number[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map((item) => Number(item)).filter((item) => Number.isInteger(item) && item > 0))].slice(0, 50);
+}
+
+function parseNumberArray(value: string): number[] {
+  try {
+    return sanitizeTargetIds(JSON.parse(value));
+  } catch {
+    return [];
+  }
+}
+
+function parseStringArray(value: string): string[] {
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.map((item) => cleanText(item, 1200)).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
 }
 
 async function deleteMessage(id: number, env: Env): Promise<Response> {

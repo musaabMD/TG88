@@ -6,8 +6,8 @@ Telegram autoposter for channels and groups, built for Cloudflare Workers + D1.
 
 - Keep a list of Telegram channels/groups.
 - Auto-register groups/channels when the bot receives a webhook update.
-- Write posts in an X-style composer.
-- Auto-save typed posts as drafts.
+- Generate Telegram post drafts with OpenRouter from one prompt.
+- Start with the first 3 AI drafts, then continue generating more batches toward a goal.
 - Schedule or publish a draft to the selected channel/group.
 - Post due messages from a Cloudflare cron trigger.
 - Keep per-target posting rules/notes from the Channels & groups menu.
@@ -49,13 +49,21 @@ npx wrangler secret put TELEGRAM_BOT_TOKEN
 npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
 ```
 
-6. Deploy:
+6. Add the OpenRouter API key as a Cloudflare secret:
+
+```bash
+npx wrangler secret put OPENROUTER_API_KEY
+```
+
+Optionally set `OPENROUTER_MODEL` in `wrangler.jsonc` vars. If omitted, TG88 uses `~openai/gpt-latest`.
+
+7. Deploy:
 
 ```bash
 npm run deploy
 ```
 
-7. Register the Telegram webhook:
+8. Register the Telegram webhook:
 
 ```bash
 curl -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
@@ -67,11 +75,20 @@ curl -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
   }'
 ```
 
-8. Run locally:
+9. Run locally:
 
 ```bash
 npm run dev
 ```
+
+## AI generation flow
+
+- Open the Posts page.
+- Select the target channels/groups.
+- Enter the content prompt.
+- Click Generate first to create the first 3 draft posts.
+- Click Continue to create the next batch until the goal is reached. The default goal is 100 drafts.
+- Review, schedule, or publish generated drafts from the Posts page.
 
 ## Telegram notes
 

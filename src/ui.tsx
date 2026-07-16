@@ -101,6 +101,15 @@ interface Post {
   createdAt: string;
 }
 
+interface AiGeneration {
+  id: number;
+  prompt: string;
+  desired_count: number;
+  batch_size: number;
+  generated_count: number;
+  model: string;
+}
+
 const GROWTH_TARGET = 5;
 const COLORS = ["#0E7490", "#7C3AED", "#2563EB", "#059669", "#DB2777", "#EA580C"];
 
@@ -518,6 +527,153 @@ function Composer({
   );
 }
 
+function AiGenerator({
+  channels,
+  onGenerated,
+  notify
+}: {
+  channels: Channel[];
+  onGenerated: () => Promise<void>;
+  notify: (message: string) => void;
+}) {
+  const [prompt, setPrompt] = useState("");
+  const [selected, setSelected] = useState<string[]>([]);
+  const [desiredCount, setDesiredCount] = useState(100);
+  const [batchSize, setBatchSize] = useState(3);
+  const [generation, setGeneration] = useState<AiGeneration | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    setSelected((current) => {
+      const valid = current.filter((id) => channels.some((channel) => channel.id === id));
+      return valid.length ? valid : channels.map((channel) => channel.id);
+    });
+  }, [channels]);
+
+  const toggle = (id: string) => setSelected((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
+  const canGenerate = prompt.trim().length > 0 && selected.length > 0 && !loading;
+
+  const generateFirst = async () => {
+    if (!canGenerate) return;
+    setLoading(true);
+    try {
+      const data = await api<{ generation: AiGeneration; posts: string[]; done: boolean }>("/api/ai/generations", {
+        method: "POST",
+        body: JSON.stringify({
+          prompt,
+          targetIds: selected.map(Number),
+          desiredCount,
+          batchSize
+        })
+      });
+      setGeneration(data.generation);
+      await onGenerated();
+      notify(`AI drafted ${data.posts.length} posts to ${selected.length} chat${selected.length === 1 ? "" : "s"}`);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "AI generation failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const continueGeneration = async () => {
+    if (!generation || loading) return;
+    setLoading(true);
+    try {
+      const data = await api<{ generation: AiGeneration; posts: string[]; done: boolean }>(
+        `/api/ai/generations/${generation.id}/continue`,
+        { method: "POST" }
+      );
+      setGeneration(data.generation);
+      await onGenerated();
+      notify(data.done ? "AI generation complete" : `AI drafted ${data.posts.length} more posts`);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "AI generation failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <Card className="p-5">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="text-sm font-semibold text-slate-900">AI content generator</p>
+          <p className="text-xs text-slate-500 mt-0.5">Write the content strategy once. TG88 drafts the first batch of 3, then continue toward 100.</p>
+        </div>
+        {generation && (
+          <Badge tone={generation.generated_count >= generation.desired_count ? "emerald" : "sky"}>
+            {generation.generated_count}/{generation.desired_count}
+          </Badge>
+        )}
+      </div>
+
+      <textarea
+        value={prompt}
+        onChange={(event) => setPrompt(event.target.value)}
+        rows={4}
+        placeholder="Example: Generate short daily posts for founders about Telegram growth, product launches, and automation. Make them direct, no fluff, include occasional CTAs."
+        className="mt-4 w-full rounded-lg border border-slate-300 p-3 text-sm text-slate-800 focus:outline-2 focus:outline-sky-500 resize-none"
+      />
+
+      <div className="flex flex-wrap items-center gap-2 mt-3">
+        {channels.map((channel) => {
+          const active = selected.includes(channel.id);
+          return (
+            <button
+              key={channel.id}
+              onClick={() => toggle(channel.id)}
+              className={`inline-flex items-center gap-1.5 px-3 h-8 rounded-full text-xs font-medium border transition-colors focus-visible:outline-2 focus-visible:outline-sky-500 ${
+                active ? "border-transparent text-white" : "border-slate-300 text-slate-600 bg-white hover:bg-slate-50"
+              }`}
+              style={active ? { backgroundColor: channel.color } : undefined}
+            >
+              <ChatIcon kind={channel.kind} className="w-3.5 h-3.5" />
+              {channel.name}
+              {active && <Check className="w-3.5 h-3.5" />}
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-4">
+        <label className="text-xs text-slate-500">
+          Goal
+          <input
+            type="number"
+            min={3}
+            max={500}
+            value={desiredCount}
+            onChange={(event) => setDesiredCount(Number(event.target.value))}
+            className="mt-1 w-full rounded-lg border border-slate-300 px-3 h-9 text-sm text-slate-700"
+          />
+        </label>
+        <label className="text-xs text-slate-500">
+          Batch size
+          <input
+            type="number"
+            min={1}
+            max={10}
+            value={batchSize}
+            onChange={(event) => setBatchSize(Number(event.target.value))}
+            className="mt-1 w-full rounded-lg border border-slate-300 px-3 h-9 text-sm text-slate-700"
+          />
+        </label>
+        <div className="flex items-end gap-2">
+          <Button disabled={!canGenerate} onClick={generateFirst} className="flex-1">
+            <Bot className="w-4 h-4" />
+            {loading && !generation ? "Generating" : "Generate first"}
+          </Button>
+          <Button disabled={!generation || loading || generation.generated_count >= generation.desired_count} variant="outline" onClick={continueGeneration} className="flex-1">
+            <RefreshCw className="w-4 h-4" />
+            Continue
+          </Button>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
 type ComposerPayload = {
   body: string;
   kind: "text" | "poll";
@@ -549,13 +705,13 @@ function StatCard({ label, value, sub, icon }: { label: string; value: string; s
 function PostPage({
   channels,
   posts,
-  onDraft,
-  onSchedule
+  onGenerated,
+  notify
 }: {
   channels: Channel[];
   posts: Post[];
-  onDraft: (payload: ComposerPayload, ids: string[]) => void;
-  onSchedule: (payload: ComposerPayload, ids: string[]) => void;
+  onGenerated: () => Promise<void>;
+  notify: (message: string) => void;
 }) {
   const totalMembers = channels.reduce((s, c) => s + c.members, 0);
   const overallHistory = channels.length
@@ -568,7 +724,7 @@ function PostPage({
 
   return (
     <div className="space-y-5">
-      <Composer channels={channels} onDraft={onDraft} onSchedule={onSchedule} />
+      <AiGenerator channels={channels} onGenerated={onGenerated} notify={notify} />
 
       <div className="grid grid-cols-2 xl:grid-cols-4 gap-4">
         <StatCard label="Members" value={totalMembers.toLocaleString()} sub={`${growth >= 0 ? "+" : ""}${growth.toFixed(1)}% this week · target ${GROWTH_TARGET}%`} icon={<Users className="w-3.5 h-3.5" />} />
@@ -1043,7 +1199,7 @@ function TG88Dashboard() {
         <main className="p-6 max-w-6xl">
           {loading && <Card className="p-10 text-center text-sm text-slate-500">Loading TG88...</Card>}
           {!loading && channels.length === 0 && <Card className="p-10 text-center text-sm text-slate-500">Use /register@dn88appbot in Telegram to add chats.</Card>}
-          {!loading && channels.length > 0 && page === "post" && <PostPage channels={channels} posts={posts} onDraft={draftPosts} onSchedule={schedulePosts} />}
+          {!loading && channels.length > 0 && page === "post" && <PostPage channels={channels} posts={posts} onGenerated={load} notify={notify} />}
           {!loading && channels.length > 0 && page === "posts" && <PostsPage posts={posts} channels={channels} onPublish={publishPosts} onDelete={deletePosts} />}
           {!loading && channels.length > 0 && page === "channels" && <ChannelsPage channels={channels} posts={posts} onOpenRules={setRulesFor} />}
           {!loading && channels.length > 0 && page === "analytics" && <AnalyticsPage channels={channels} />}
