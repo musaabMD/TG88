@@ -3,6 +3,8 @@ import { createRoot } from "react-dom/client";
 import {
   Bot,
   CalendarDays,
+  ChevronLeft,
+  ChevronRight,
   Check,
   CheckCircle2,
   CornerDownLeft,
@@ -190,6 +192,17 @@ function planDays(): { key: string; label: string; weekday: string }[] {
       label: date.toLocaleDateString(undefined, { month: "short", day: "numeric" }),
       weekday: date.toLocaleDateString(undefined, { weekday: "short" })
     };
+  });
+}
+
+function monthGridDays(month: Date): Date[] {
+  const first = new Date(month.getFullYear(), month.getMonth(), 1);
+  const start = new Date(first);
+  start.setDate(first.getDate() - first.getDay());
+  return Array.from({ length: 42 }, (_, index) => {
+    const date = new Date(start);
+    date.setDate(start.getDate() + index);
+    return date;
   });
 }
 
@@ -841,6 +854,12 @@ type Filter = "all" | PostStatus;
 
 function CalendarPlan({ posts, channels }: { posts: Post[]; channels: Channel[] }) {
   const days = useMemo(() => planDays(), []);
+  const [month, setMonth] = useState(() => {
+    const date = new Date();
+    date.setDate(1);
+    date.setHours(0, 0, 0, 0);
+    return date;
+  });
   const scheduled = posts.filter((post) => post.status === "scheduled");
   const rows = channels.map((channel) => {
     const counts = days.map((day) =>
@@ -858,6 +877,21 @@ function CalendarPlan({ posts, channels }: { posts: Post[]; channels: Channel[] 
   const overallPercent = totalSlots > 0 ? Math.round((coveredSlots / totalSlots) * 100) : 0;
   const missingSlots = rows.reduce((sum, row) => sum + row.missing, 0);
   const completeChannels = rows.filter((row) => row.percent >= 100).length;
+  const monthDays = monthGridDays(month);
+  const todayKey = dateKey(new Date());
+  const monthLabel = month.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+  const monthPosts = scheduled.filter((post) => {
+    const date = new Date(post.scheduledAt);
+    return date.getFullYear() === month.getFullYear() && date.getMonth() === month.getMonth();
+  });
+  const moveMonth = (offset: number) => {
+    setMonth((current) => new Date(current.getFullYear(), current.getMonth() + offset, 1));
+  };
+  const goToday = () => {
+    const date = new Date();
+    setMonth(new Date(date.getFullYear(), date.getMonth(), 1));
+  };
+  const channelName = (id: string) => channels.find((channel) => channel.id === id)?.name ?? "Chat";
 
   return (
     <div className="space-y-4">
@@ -868,62 +902,77 @@ function CalendarPlan({ posts, channels }: { posts: Post[]; channels: Channel[] 
       </div>
 
       <Card className="overflow-hidden">
-        <div className="flex flex-wrap items-center justify-between gap-3 p-4 border-b border-slate-100">
+        <div className="flex flex-wrap items-center justify-between gap-3 p-5 border-b border-slate-100">
           <div>
-            <p className="text-sm font-semibold text-slate-900">30-day calendar</p>
-            <p className="text-xs text-slate-500 mt-0.5">Each channel/group needs at least {DAILY_PLAN_TARGET} scheduled posts per day.</p>
+            <div className="flex items-baseline gap-2">
+              <h2 className="text-3xl font-semibold tracking-tight text-slate-950">{monthLabel.split(" ")[0]}</h2>
+              <span className="text-3xl font-light text-slate-500">{monthLabel.split(" ")[1]}</span>
+            </div>
+            <p className="text-xs text-slate-500 mt-1">
+              {monthPosts.length} scheduled posts this month · target {DAILY_PLAN_TARGET}/day/chat
+            </p>
           </div>
-          <Badge tone={coverageTone(overallPercent)}>{overallPercent}% all</Badge>
+          <div className="flex items-center gap-2">
+            <Button size="sm" variant="ghost" onClick={() => moveMonth(-1)} title="Previous month">
+              <ChevronLeft className="w-4 h-4" />
+            </Button>
+            <Button size="sm" variant="outline" onClick={goToday}>Today</Button>
+            <Button size="sm" variant="ghost" onClick={() => moveMonth(1)} title="Next month">
+              <ChevronRight className="w-4 h-4" />
+            </Button>
+          </div>
         </div>
 
-        <div className="overflow-x-auto">
-          <table className="min-w-full border-separate border-spacing-0 text-sm">
-            <thead>
-              <tr>
-                <th className="sticky left-0 z-10 bg-white text-left px-4 py-3 border-b border-slate-100 min-w-64">
-                  <span className="text-xs font-semibold text-slate-500">Chat</span>
-                </th>
-                <th className="bg-white text-left px-3 py-3 border-b border-slate-100 min-w-24">
-                  <span className="text-xs font-semibold text-slate-500">Coverage</span>
-                </th>
-                {days.map((day) => (
-                  <th key={day.key} className="bg-white px-2 py-3 border-b border-slate-100 min-w-20 text-center">
-                    <span className="block text-[11px] font-semibold text-slate-700">{day.label}</span>
-                    <span className="block text-[10px] text-slate-400 mt-0.5">{day.weekday}</span>
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row) => (
-                <tr key={row.channel.id}>
-                  <td className="sticky left-0 z-10 bg-white px-4 py-3 border-b border-slate-100">
-                    <div className="flex items-center gap-3 min-w-0">
-                      <ChannelAvatar channel={row.channel} size="sm" />
-                      <div className="min-w-0">
-                        <p className="font-semibold text-slate-800 truncate">{row.channel.name}</p>
-                        <p className="text-[11px] text-slate-400">{row.channel.kind}</p>
-                      </div>
-                    </div>
-                  </td>
-                  <td className="px-3 py-3 border-b border-slate-100">
-                    <Badge tone={coverageTone(row.percent)}>{row.percent}%</Badge>
-                    {row.missing > 0 && <p className="text-[11px] text-slate-400 mt-1">{row.missing} missing</p>}
-                  </td>
-                  {row.counts.map((count, index) => {
-                    const tone = count >= DAILY_PLAN_TARGET ? "bg-emerald-50 text-emerald-700 border-emerald-200" : count > 0 ? "bg-amber-50 text-amber-700 border-amber-200" : "bg-red-50 text-red-600 border-red-100";
+        <div className="grid grid-cols-7 border-b border-slate-200 bg-white">
+          {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((day) => (
+            <div key={day} className="px-3 py-3 text-right text-sm font-medium text-slate-500 border-r border-slate-100 last:border-r-0">
+              {day}
+            </div>
+          ))}
+        </div>
+
+        <div className="grid grid-cols-7 bg-white">
+          {monthDays.map((day) => {
+            const key = dateKey(day);
+            const inMonth = day.getMonth() === month.getMonth();
+            const dayPosts = scheduled
+              .filter((post) => dateKey(new Date(post.scheduledAt)) === key)
+              .sort((a, b) => new Date(a.scheduledAt).getTime() - new Date(b.scheduledAt).getTime());
+            const visiblePosts = dayPosts.slice(0, 5);
+            const dayTotalTarget = channels.length * DAILY_PLAN_TARGET;
+            const dayCoverage = dayTotalTarget > 0 ? Math.round((Math.min(dayPosts.length, dayTotalTarget) / dayTotalTarget) * 100) : 0;
+
+            return (
+              <div key={key} className={`min-h-44 border-r border-b border-slate-100 p-3 last:border-r-0 ${inMonth ? "bg-white" : "bg-slate-50/60"}`}>
+                <div className="flex items-start justify-between gap-2">
+                  <span className={`text-lg leading-none ${inMonth ? "text-slate-800" : "text-slate-300"} ${key === todayKey ? "inline-flex items-center justify-center w-8 h-8 rounded-full bg-red-500 text-white font-semibold" : ""}`}>
+                    {day.getDate()}
+                  </span>
+                  {inMonth && (
+                    <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full border ${dayCoverage >= 100 ? "bg-emerald-50 text-emerald-700 border-emerald-200" : dayPosts.length > 0 ? "bg-amber-50 text-amber-700 border-amber-200" : "bg-slate-50 text-slate-400 border-slate-200"}`}>
+                      {dayCoverage}%
+                    </span>
+                  )}
+                </div>
+
+                <div className="mt-3 space-y-1.5">
+                  {visiblePosts.map((post) => {
+                    const time = new Date(post.scheduledAt).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
                     return (
-                      <td key={`${row.channel.id}-${days[index].key}`} className="px-2 py-3 border-b border-slate-100 text-center">
-                        <span className={`inline-flex items-center justify-center w-10 h-7 rounded-lg border text-xs font-semibold tabular-nums ${tone}`}>
-                          {count}
-                        </span>
-                      </td>
+                      <div key={post.id} className="grid grid-cols-[4px_minmax(0,1fr)_auto] items-center gap-2 text-xs">
+                        <span className="h-5 rounded-full bg-red-500" />
+                        <span className="truncate text-slate-800 font-medium">{post.text || channelName(post.channelId)}</span>
+                        <span className="text-slate-400 tabular-nums">{time}</span>
+                      </div>
                     );
                   })}
-                </tr>
-              ))}
-            </tbody>
-          </table>
+                  {dayPosts.length > visiblePosts.length && (
+                    <p className="text-[11px] text-slate-400 pl-3">+{dayPosts.length - visiblePosts.length} more</p>
+                  )}
+                </div>
+              </div>
+            );
+          })}
         </div>
       </Card>
     </div>
@@ -1541,7 +1590,7 @@ function TG88Dashboard() {
           </div>
         </header>
 
-        <main className="p-6 max-w-6xl">
+        <main className="p-6 w-full">
           {loading && <Card className="p-10 text-center text-sm text-slate-500">Loading TG88...</Card>}
           {!loading && channels.length === 0 && <Card className="p-10 text-center text-sm text-slate-500">Use /register@dn88appbot in Telegram to add chats.</Card>}
           {!loading && channels.length > 0 && page === "post" && <PostPage channels={channels} posts={posts} onGenerated={load} notify={notify} />}
