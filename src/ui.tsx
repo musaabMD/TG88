@@ -135,6 +135,11 @@ interface AiGeneration {
   model: string;
 }
 
+interface GeneratedContentRow {
+  text: string;
+  pollOptions?: string[];
+}
+
 const GROWTH_TARGET = 5;
 const PLAN_DAYS = 30;
 const DAILY_PLAN_TARGET = 5;
@@ -646,10 +651,12 @@ function AiGenerator({
   notify: (message: string) => void;
 }) {
   const [prompt, setPrompt] = useState("");
+  const [contentType, setContentType] = useState<"text" | "poll">("text");
   const [selected, setSelected] = useState<string[]>([]);
   const [desiredCount, setDesiredCount] = useState(100);
   const [batchSize, setBatchSize] = useState(3);
   const [generation, setGeneration] = useState<AiGeneration | null>(null);
+  const [rows, setRows] = useState<GeneratedContentRow[]>([]);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
@@ -666,18 +673,20 @@ function AiGenerator({
     if (!canGenerate) return;
     setLoading(true);
     try {
-      const data = await api<{ generation: AiGeneration; posts: string[]; done: boolean }>("/api/ai/generations", {
+      const data = await api<{ generation: AiGeneration; posts: GeneratedContentRow[]; done: boolean }>("/api/ai/generations", {
         method: "POST",
         body: JSON.stringify({
           prompt,
           targetIds: selected.map(Number),
           desiredCount,
-          batchSize
+          batchSize,
+          kind: contentType
         })
       });
       setGeneration(data.generation);
+      setRows(data.posts);
       await onGenerated();
-      notify(`AI drafted ${data.posts.length} posts to ${selected.length} chat${selected.length === 1 ? "" : "s"}`);
+      notify(`AI drafted ${data.posts.length} ${contentType === "poll" ? "polls" : "posts"} to ${selected.length} chat${selected.length === 1 ? "" : "s"}`);
     } catch (error) {
       notify(error instanceof Error ? error.message : "AI generation failed");
     } finally {
@@ -689,13 +698,14 @@ function AiGenerator({
     if (!generation || loading) return;
     setLoading(true);
     try {
-      const data = await api<{ generation: AiGeneration; posts: string[]; done: boolean }>(
+      const data = await api<{ generation: AiGeneration; posts: GeneratedContentRow[]; done: boolean }>(
         `/api/ai/generations/${generation.id}/continue`,
         { method: "POST" }
       );
       setGeneration(data.generation);
+      setRows((current) => [...current, ...data.posts]);
       await onGenerated();
-      notify(data.done ? "AI generation complete" : `AI drafted ${data.posts.length} more posts`);
+      notify(data.done ? "AI generation complete" : `AI drafted ${data.posts.length} more ${contentType === "poll" ? "polls" : "posts"}`);
     } catch (error) {
       notify(error instanceof Error ? error.message : "AI generation failed");
     } finally {
@@ -704,17 +714,27 @@ function AiGenerator({
   };
 
   return (
-    <Card className="p-5">
+    <Card className="overflow-hidden">
+      <div className="p-5 border-b border-slate-100">
       <div className="flex items-start justify-between gap-3">
         <div>
-          <p className="text-sm font-semibold text-slate-900">AI content generator</p>
-          <p className="text-xs text-slate-500 mt-0.5">Write the content strategy once. TG88 drafts the first batch of 3, then continue toward 100.</p>
+          <p className="text-sm font-semibold text-slate-900">Content table</p>
+          <p className="text-xs text-slate-500 mt-0.5">Generate the first 3 rows with AI, then continue adding more.</p>
         </div>
         {generation && (
           <Badge tone={generation.generated_count >= generation.desired_count ? "emerald" : "sky"}>
             {generation.generated_count}/{generation.desired_count}
           </Badge>
         )}
+      </div>
+
+      <div className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white p-1 mt-4">
+        <button onClick={() => setContentType("text")} className={`h-8 px-3 rounded-md text-xs font-medium ${contentType === "text" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-50"}`}>
+          Text
+        </button>
+        <button onClick={() => setContentType("poll")} className={`h-8 px-3 rounded-md text-xs font-medium ${contentType === "poll" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-50"}`}>
+          Poll
+        </button>
       </div>
 
       <textarea
@@ -778,6 +798,52 @@ function AiGenerator({
             Continue
           </Button>
         </div>
+      </div>
+      </div>
+
+      <div className="overflow-x-auto">
+        <table className="min-w-full text-sm">
+          <thead>
+            <tr className="bg-slate-50 border-b border-slate-100">
+              <th className="text-left px-4 py-3 text-xs font-semibold text-slate-500 w-16">#</th>
+              <th className="text-left px-4 py-3 text-xs font-semibold text-slate-500">Content</th>
+              <th className="text-left px-4 py-3 text-xs font-semibold text-slate-500 w-48">Type</th>
+              <th className="text-left px-4 py-3 text-xs font-semibold text-slate-500 w-48">Status</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {rows.length === 0 && (
+              <tr>
+                <td colSpan={4} className="px-4 py-10 text-center text-sm text-slate-400">
+                  No generated rows yet. Click Generate first to create 3.
+                </td>
+              </tr>
+            )}
+            {rows.map((row, index) => (
+              <tr key={`${row.text}-${index}`} className="align-top">
+                <td className="px-4 py-3 text-xs text-slate-400 tabular-nums">{index + 1}</td>
+                <td className="px-4 py-3">
+                  <p className="text-slate-800 leading-snug">{row.text}</p>
+                  {row.pollOptions && (
+                    <div className="flex flex-wrap gap-1.5 mt-2">
+                      {row.pollOptions.map((option) => (
+                        <span key={option} className="px-2 py-1 rounded-full bg-slate-100 text-[11px] text-slate-600">
+                          {option}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </td>
+                <td className="px-4 py-3">
+                  <Badge tone={row.pollOptions ? "violet" : "sky"}>{row.pollOptions ? "Poll" : "Text"}</Badge>
+                </td>
+                <td className="px-4 py-3">
+                  <Badge tone="amber">Draft saved</Badge>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
     </Card>
   );

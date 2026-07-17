@@ -157,6 +157,11 @@ type AiGeneration = {
   updated_at: string;
 };
 
+type GeneratedPostDraft = {
+  text: string;
+  pollOptions?: string[];
+};
+
 type ModerationAction = {
   id: number;
   target_id: number | null;
@@ -874,15 +879,18 @@ async function createAiGeneration(request: Request, env: Env): Promise<Response>
     desiredCount?: number;
     batchSize?: number;
     model?: string;
+    kind?: string;
   }>(request);
 
-  const prompt = cleanText(input.prompt, 12000);
+  const kind = input.kind === "poll" ? "poll" : "text";
+  const rawPrompt = cleanText(input.prompt, 11950);
+  const prompt = cleanText(`${rawPrompt}\n\nContent type: ${kind}.`, 12000);
   const targetIds = sanitizeTargetIds(input.targetIds);
   const desiredCount = Math.max(3, Math.min(500, Math.floor(Number(input.desiredCount ?? 100))));
   const batchSize = Math.max(1, Math.min(10, Math.floor(Number(input.batchSize ?? 3))));
   const model = cleanText(input.model, 120) || env.OPENROUTER_MODEL || "~openai/gpt-latest";
 
-  if (!prompt) return json({ error: "Prompt is required" }, 400);
+  if (!rawPrompt) return json({ error: "Prompt is required" }, 400);
   if (targetIds.length === 0) return json({ error: "Choose at least one channel or group" }, 400);
   if (!(await targetsExist(env, targetIds))) return json({ error: "One or more selected chats no longer exist" }, 400);
 
@@ -916,18 +924,19 @@ async function runAiGenerationBatch(id: number, env: Env): Promise<Response> {
     const remaining = Math.max(0, generation.desired_count - generation.generated_count);
     const count = Math.min(generation.batch_size, remaining);
     const targets = await getTargetsByIds(env, targetIds);
-    const generated = await generatePostsWithOpenRouter(env, generation, targets, previousOutputs, count);
+    const kind = generation.prompt.includes("Content type: poll.") ? "poll" : "text";
+    const generated = await generatePostsWithOpenRouter(env, generation, targets, previousOutputs, count, kind);
 
     const now = new Date().toISOString();
     for (const targetId of targetIds) {
-      for (const text of generated) {
+      for (const post of generated) {
         await insertMessage(
           env,
           targetId,
           {
-            body: text,
-            kind: "text",
-            pollOptionsJson: null,
+            body: post.text,
+            kind,
+            pollOptionsJson: kind === "poll" ? JSON.stringify((post.pollOptions ?? ["Yes", "No"]).slice(0, 10)) : null,
             linkPreviewEnabled: true,
             repeatCount: 1,
             repeatIntervalMinutes: 1440,
@@ -939,7 +948,7 @@ async function runAiGenerationBatch(id: number, env: Env): Promise<Response> {
       }
     }
 
-    const nextOutputs = [...previousOutputs, ...generated].slice(-80);
+    const nextOutputs = [...previousOutputs, ...generated.map((post) => post.text)].slice(-80);
     const nextCount = generation.generated_count + generated.length;
     await env.DB.prepare(
       `UPDATE ai_generations
@@ -959,8 +968,9 @@ async function generatePostsWithOpenRouter(
   generation: AiGeneration,
   targets: Target[],
   previousOutputs: string[],
-  count: number
-): Promise<string[]> {
+  count: number,
+  kind: "text" | "poll"
+): Promise<GeneratedPostDraft[]> {
   if (!env.OPENROUTER_API_KEY) {
     throw new Error("OPENROUTER_API_KEY is not configured");
   }
@@ -986,12 +996,12 @@ async function generatePostsWithOpenRouter(
         {
           role: "system",
           content:
-            "You write concise Telegram posts. Return only valid JSON matching {\"posts\":[{\"text\":\"...\"}]}. No markdown. No explanations. Each post must be distinct, ready to publish, and under 900 characters."
+            "You write concise Telegram content. Return only valid JSON. For text use {\"posts\":[{\"text\":\"...\"}]}. For polls use {\"posts\":[{\"text\":\"Poll question\",\"pollOptions\":[\"Option A\",\"Option B\"]}]}. No markdown. No explanations. Each item must be distinct and ready to publish."
         },
         {
           role: "user",
           content: JSON.stringify({
-            task: `Generate exactly ${count} new Telegram posts.`,
+            task: `Generate exactly ${count} new Telegram ${kind === "poll" ? "polls" : "posts"}.`,
             prompt: generation.prompt,
             target_chats: targetContext,
             previous_posts_to_avoid: previousOutputs.slice(-30)
@@ -1013,18 +1023,28 @@ async function generatePostsWithOpenRouter(
   }
 
   const content = data.choices?.[0]?.message?.content ?? "";
-  const parsed = parseGeneratedPosts(content);
+  const parsed = parseGeneratedPosts(content, kind);
   if (parsed.length === 0) throw new Error("OpenRouter returned no posts");
   return parsed.slice(0, count);
 }
 
-function parseGeneratedPosts(content: string): string[] {
+function parseGeneratedPosts(content: string, kind: "text" | "poll"): GeneratedPostDraft[] {
   try {
     const parsed = JSON.parse(content);
     const posts = Array.isArray(parsed.posts) ? parsed.posts : [];
     return posts
-      .map((post: { text?: unknown }) => cleanText(post.text, 900))
-      .filter(Boolean);
+      .map((post: { text?: unknown; pollOptions?: unknown }) => {
+        const text = cleanText(post.text, kind === "poll" ? 300 : 900);
+        if (!text) return null;
+        const pollOptions = Array.isArray(post.pollOptions)
+          ? post.pollOptions.map((option) => cleanText(option, 100)).filter(Boolean).slice(0, 10)
+          : [];
+        return {
+          text,
+          pollOptions: kind === "poll" && pollOptions.length >= 2 ? pollOptions : undefined
+        };
+      })
+      .filter((post: GeneratedPostDraft | null): post is GeneratedPostDraft => Boolean(post));
   } catch {
     return [];
   }
