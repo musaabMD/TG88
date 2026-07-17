@@ -2,12 +2,12 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createRoot } from "react-dom/client";
 import {
   Bot,
+  CalendarDays,
   Check,
   CheckCircle2,
   CornerDownLeft,
   Eye,
   FileText,
-  LayoutList,
   LineChart as LineChartIcon,
   MessagesSquare,
   PenLine,
@@ -38,6 +38,7 @@ import {
 type ChannelKind = "channel" | "group";
 type PostStatus = "draft" | "published" | "scheduled" | "failed";
 type Page = "post" | "posts" | "channels" | "analytics";
+type PlannerView = "posts" | "calendar";
 
 interface ApiTarget {
   id: number;
@@ -49,6 +50,8 @@ interface ApiTarget {
   rules: string;
   moderation_enabled: number;
   moderation_rules: string;
+  photo_file_id: string | null;
+  photo_updated_at: string | null;
   moderation_action_count?: number;
   moderation_actions?: ApiModerationAction[];
   post_count?: number;
@@ -104,6 +107,7 @@ interface Channel {
   moderationRules: string;
   moderationActionCount: number;
   moderationActions: ApiModerationAction[];
+  avatarUrl: string | null;
   color: string;
   memberHistory: number[];
   viewHistory: number[];
@@ -117,6 +121,7 @@ interface Post {
   pollOptions: string[];
   status: PostStatus;
   publishedAt: string | null;
+  scheduledAt: string;
   views: number;
   createdAt: string;
 }
@@ -131,18 +136,20 @@ interface AiGeneration {
 }
 
 const GROWTH_TARGET = 5;
+const PLAN_DAYS = 30;
+const DAILY_PLAN_TARGET = 5;
 const COLORS = ["#0E7490", "#7C3AED", "#2563EB", "#059669", "#DB2777", "#EA580C"];
 
 const NAV: { id: Page; label: string; icon: React.ReactNode }[] = [
   { id: "post", label: "Post", icon: <Send className="w-4 h-4" /> },
-  { id: "posts", label: "Posts", icon: <LayoutList className="w-4 h-4" /> },
+  { id: "posts", label: "Planner", icon: <CalendarDays className="w-4 h-4" /> },
   { id: "channels", label: "Channels", icon: <Radio className="w-4 h-4" /> },
   { id: "analytics", label: "Analytics", icon: <LineChartIcon className="w-4 h-4" /> }
 ];
 
 const PAGE_TITLES: Record<Page, { title: string; sub: string }> = {
   post: { title: "Post", sub: "Write once, draft to every selected chat" },
-  posts: { title: "Posts", sub: "Select drafts and publish in one click" },
+  posts: { title: "Planner", sub: "Posts list and 30-day schedule coverage" },
   channels: { title: "Channels & groups", sub: "Growth and activity per chat" },
   analytics: { title: "Analytics", sub: "Members and views against the 5% weekly goal" }
 };
@@ -164,6 +171,39 @@ function fmtTime(iso: string | null) {
     hour: "numeric",
     minute: "2-digit"
   });
+}
+
+function dateKey(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function planDays(): { key: string; label: string; weekday: string }[] {
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  return Array.from({ length: PLAN_DAYS }, (_, index) => {
+    const date = new Date(start);
+    date.setDate(start.getDate() + index);
+    return {
+      key: dateKey(date),
+      label: date.toLocaleDateString(undefined, { month: "short", day: "numeric" }),
+      weekday: date.toLocaleDateString(undefined, { weekday: "short" })
+    };
+  });
+}
+
+function planCoverage(counts: number[]): number {
+  if (counts.length === 0) return 0;
+  const covered = counts.reduce((sum, count) => sum + Math.min(count, DAILY_PLAN_TARGET), 0);
+  return Math.round((covered / (counts.length * DAILY_PLAN_TARGET)) * 100);
+}
+
+function coverageTone(percent: number): "emerald" | "amber" | "red" {
+  if (percent >= 100) return "emerald";
+  if (percent >= 70) return "amber";
+  return "red";
 }
 
 function Card({ children, className = "" }: { children: React.ReactNode; className?: string }) {
@@ -254,6 +294,33 @@ function ChatIcon({ kind, className = "w-4 h-4" }: { kind: ChannelKind; classNam
   return kind === "channel" ? <Radio className={className} /> : <MessagesSquare className={className} />;
 }
 
+function ChannelAvatar({ channel, size = "md" }: { channel?: Channel; size?: "sm" | "md" | "lg" }) {
+  const [failed, setFailed] = useState(false);
+  const sizeClass = size === "sm" ? "w-8 h-8 rounded-lg" : size === "lg" ? "w-10 h-10 rounded-xl" : "w-9 h-9 rounded-full";
+  const iconClass = size === "sm" ? "w-3.5 h-3.5" : "w-4 h-4";
+
+  useEffect(() => {
+    setFailed(false);
+  }, [channel?.avatarUrl]);
+
+  if (channel?.avatarUrl && !failed) {
+    return (
+      <img
+        src={channel.avatarUrl}
+        alt=""
+        onError={() => setFailed(true)}
+        className={`${sizeClass} object-cover shrink-0 bg-slate-100`}
+      />
+    );
+  }
+
+  return (
+    <span className={`${sizeClass} flex items-center justify-center text-white shrink-0`} style={{ backgroundColor: channel?.color ?? "#0F172A" }}>
+      <ChatIcon kind={channel?.kind ?? "channel"} className={iconClass} />
+    </span>
+  );
+}
+
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {
     ...options,
@@ -265,6 +332,7 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
 }
 
 function mapData(targets: ApiTarget[]): { channels: Channel[]; posts: Post[] } {
+  const parentByChatId = new Map(targets.filter((target) => target.thread_id === 0).map((target) => [target.chat_id, target]));
   const channels = targets.map((target, index) => ({
     id: String(target.id),
     chatId: target.chat_id,
@@ -277,6 +345,11 @@ function mapData(targets: ApiTarget[]): { channels: Channel[]; posts: Post[] } {
     moderationRules: target.moderation_rules ?? "",
     moderationActionCount: target.moderation_action_count ?? 0,
     moderationActions: target.moderation_actions ?? [],
+    avatarUrl: target.photo_file_id
+      ? `/api/targets/${target.id}/photo?v=${encodeURIComponent(target.photo_updated_at ?? target.photo_file_id)}`
+      : parentByChatId.get(target.chat_id)?.photo_file_id
+        ? `/api/targets/${parentByChatId.get(target.chat_id)?.id}/photo?v=${encodeURIComponent(parentByChatId.get(target.chat_id)?.photo_updated_at ?? parentByChatId.get(target.chat_id)?.photo_file_id ?? "")}`
+        : null,
     color: COLORS[index % COLORS.length],
     memberHistory: normalizeHistory(target.member_history, target.member_count ?? 0),
     viewHistory: normalizeHistory(target.view_history, target.view_count ?? 0)
@@ -291,6 +364,7 @@ function mapData(targets: ApiTarget[]): { channels: Channel[]; posts: Post[] } {
       pollOptions: parseOptions(message.poll_options),
       status: normalizeStatus(message.status),
       publishedAt: message.posted_at,
+      scheduledAt: message.scheduled_at,
       views: message.view_count ?? 0,
       createdAt: message.created_at || message.scheduled_at
     }))
@@ -766,6 +840,97 @@ function PostPage({
 
 type Filter = "all" | PostStatus;
 
+function CalendarPlan({ posts, channels }: { posts: Post[]; channels: Channel[] }) {
+  const days = useMemo(() => planDays(), []);
+  const scheduled = posts.filter((post) => post.status === "scheduled");
+  const rows = channels.map((channel) => {
+    const counts = days.map((day) =>
+      scheduled.filter((post) => post.channelId === channel.id && dateKey(new Date(post.scheduledAt)) === day.key).length
+    );
+    return {
+      channel,
+      counts,
+      percent: planCoverage(counts),
+      missing: counts.reduce((sum, count) => sum + Math.max(0, DAILY_PLAN_TARGET - count), 0)
+    };
+  });
+  const totalSlots = rows.length * days.length * DAILY_PLAN_TARGET;
+  const coveredSlots = rows.reduce((sum, row) => sum + row.counts.reduce((inner, count) => inner + Math.min(count, DAILY_PLAN_TARGET), 0), 0);
+  const overallPercent = totalSlots > 0 ? Math.round((coveredSlots / totalSlots) * 100) : 0;
+  const missingSlots = rows.reduce((sum, row) => sum + row.missing, 0);
+  const completeChannels = rows.filter((row) => row.percent >= 100).length;
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <StatCard label="30-day coverage" value={`${overallPercent}%`} sub={`${coveredSlots}/${totalSlots || 0} required slots covered`} icon={<CalendarDays className="w-3.5 h-3.5" />} />
+        <StatCard label="Missing" value={String(missingSlots)} sub={`need ${DAILY_PLAN_TARGET}/day for every chat`} icon={<Target className="w-3.5 h-3.5" />} />
+        <StatCard label="Complete chats" value={`${completeChannels}/${channels.length}`} sub="fully planned for 30 days" icon={<CheckCircle2 className="w-3.5 h-3.5" />} />
+      </div>
+
+      <Card className="overflow-hidden">
+        <div className="flex flex-wrap items-center justify-between gap-3 p-4 border-b border-slate-100">
+          <div>
+            <p className="text-sm font-semibold text-slate-900">30-day calendar</p>
+            <p className="text-xs text-slate-500 mt-0.5">Each channel/group needs at least {DAILY_PLAN_TARGET} scheduled posts per day.</p>
+          </div>
+          <Badge tone={coverageTone(overallPercent)}>{overallPercent}% all</Badge>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="min-w-full border-separate border-spacing-0 text-sm">
+            <thead>
+              <tr>
+                <th className="sticky left-0 z-10 bg-white text-left px-4 py-3 border-b border-slate-100 min-w-64">
+                  <span className="text-xs font-semibold text-slate-500">Chat</span>
+                </th>
+                <th className="bg-white text-left px-3 py-3 border-b border-slate-100 min-w-24">
+                  <span className="text-xs font-semibold text-slate-500">Coverage</span>
+                </th>
+                {days.map((day) => (
+                  <th key={day.key} className="bg-white px-2 py-3 border-b border-slate-100 min-w-20 text-center">
+                    <span className="block text-[11px] font-semibold text-slate-700">{day.label}</span>
+                    <span className="block text-[10px] text-slate-400 mt-0.5">{day.weekday}</span>
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={row.channel.id}>
+                  <td className="sticky left-0 z-10 bg-white px-4 py-3 border-b border-slate-100">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <ChannelAvatar channel={row.channel} size="sm" />
+                      <div className="min-w-0">
+                        <p className="font-semibold text-slate-800 truncate">{row.channel.name}</p>
+                        <p className="text-[11px] text-slate-400">{row.channel.kind}</p>
+                      </div>
+                    </div>
+                  </td>
+                  <td className="px-3 py-3 border-b border-slate-100">
+                    <Badge tone={coverageTone(row.percent)}>{row.percent}%</Badge>
+                    {row.missing > 0 && <p className="text-[11px] text-slate-400 mt-1">{row.missing} missing</p>}
+                  </td>
+                  {row.counts.map((count, index) => {
+                    const tone = count >= DAILY_PLAN_TARGET ? "bg-emerald-50 text-emerald-700 border-emerald-200" : count > 0 ? "bg-amber-50 text-amber-700 border-amber-200" : "bg-red-50 text-red-600 border-red-100";
+                    return (
+                      <td key={`${row.channel.id}-${days[index].key}`} className="px-2 py-3 border-b border-slate-100 text-center">
+                        <span className={`inline-flex items-center justify-center w-10 h-7 rounded-lg border text-xs font-semibold tabular-nums ${tone}`}>
+                          {count}
+                        </span>
+                      </td>
+                    );
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
 function PostsPage({
   posts,
   channels,
@@ -777,6 +942,7 @@ function PostsPage({
   onPublish: (ids: string[]) => void;
   onDelete: (ids: string[]) => void;
 }) {
+  const [view, setView] = useState<PlannerView>("calendar");
   const [filter, setFilter] = useState<Filter>("all");
   const [selected, setSelected] = useState<string[]>([]);
   const rows = posts.filter((p) => filter === "all" || p.status === filter);
@@ -800,7 +966,7 @@ function PostsPage({
     { id: "published", label: "Published" }
   ];
 
-  return (
+  const listView = (
     <Card>
       <div className="flex flex-wrap items-center justify-between gap-3 p-4 border-b border-slate-100">
         <div className="flex items-center gap-1">
@@ -836,9 +1002,7 @@ function PostsPage({
           return (
             <label key={p.id} className={`flex items-start gap-3 px-4 py-3 cursor-pointer transition-colors ${checked ? "bg-sky-50/60" : "hover:bg-slate-50/70"}`}>
               <input type="checkbox" checked={checked} onChange={() => toggleOne(p.id)} className="accent-slate-900 w-4 h-4 mt-1.5 shrink-0" />
-              <span className="w-9 h-9 rounded-full flex items-center justify-center text-white shrink-0" style={{ backgroundColor: c?.color }}>
-                <ChatIcon kind={c?.kind ?? "channel"} className="w-4 h-4" />
-              </span>
+              <ChannelAvatar channel={c} />
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2 text-xs leading-none">
                   <span className="font-semibold text-slate-900 truncate">{c?.name}</span>
@@ -885,6 +1049,26 @@ function PostsPage({
       </div>
     </Card>
   );
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white p-1">
+          <button onClick={() => setView("calendar")} className={`h-8 px-3 rounded-md text-xs font-medium ${view === "calendar" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-50"}`}>
+            Calendar
+          </button>
+          <button onClick={() => setView("posts")} className={`h-8 px-3 rounded-md text-xs font-medium ${view === "posts" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-50"}`}>
+            Posts
+          </button>
+        </div>
+        <Badge tone="sky">
+          <CalendarDays className="w-3 h-3" />
+          {DAILY_PLAN_TARGET}/day · {PLAN_DAYS} days
+        </Badge>
+      </div>
+      {view === "calendar" ? <CalendarPlan posts={posts} channels={channels} /> : listView}
+    </div>
+  );
 }
 
 function ChannelsPage({ channels, posts, onOpenRules }: { channels: Channel[]; posts: Post[]; onOpenRules: (c: Channel) => void }) {
@@ -899,9 +1083,7 @@ function ChannelsPage({ channels, posts, onOpenRules }: { channels: Channel[]; p
             <Card key={c.id} className="p-5">
               <div className="flex items-center justify-between gap-2">
                 <div className="flex items-center gap-3 min-w-0">
-                  <span className="w-10 h-10 rounded-xl flex items-center justify-center text-white shrink-0" style={{ backgroundColor: c.color }}>
-                    <ChatIcon kind={c.kind} />
-                  </span>
+                  <ChannelAvatar channel={c} size="lg" />
                   <div className="min-w-0">
                     <p className="text-sm font-semibold text-slate-900 truncate">{c.name}</p>
                     <p className="text-[11px] text-slate-400 truncate">{c.chatId}</p>
@@ -1045,9 +1227,7 @@ function AnalyticsPage({ channels }: { channels: Channel[] }) {
         <div className="space-y-4">
           {channels.map((c) => (
             <div key={c.id} className="flex items-center gap-4">
-              <span className="w-8 h-8 rounded-lg flex items-center justify-center text-white shrink-0" style={{ backgroundColor: c.color }}>
-                <ChatIcon kind={c.kind} className="w-3.5 h-3.5" />
-              </span>
+              <ChannelAvatar channel={c} size="sm" />
               <div className="w-40 min-w-0">
                 <p className="text-sm font-medium text-slate-800 truncate">{c.name}</p>
                 <p className="text-[11px] text-slate-400">{c.members.toLocaleString()} members</p>

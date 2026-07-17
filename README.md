@@ -10,6 +10,9 @@ Telegram autoposter for channels and groups, built for Cloudflare Workers + D1.
 - Start with the first 3 AI drafts, then continue generating more batches toward a goal.
 - Schedule or publish a draft to the selected channel/group.
 - Post due messages from a Cloudflare cron trigger.
+- Pull Telegram group/channel logos and show them in the app.
+- Show a Planner page with Posts and Calendar views.
+- Track 30-day schedule coverage against the rule: at least 5 scheduled posts per day for every chat.
 - Keep per-target posting rules/notes from the Channels & groups menu.
 - Moderate large groups silently by deleting and banning spam, links, photos, bot accounts, and invite/course promotion.
 - Filter posts by draft, scheduled, and published.
@@ -84,12 +87,19 @@ npm run dev
 
 ## AI generation flow
 
-- Open the Posts page.
+- Open the Post page.
 - Select the target channels/groups.
 - Enter the content prompt.
 - Click Generate first to create the first 3 draft posts.
 - Click Continue to create the next batch until the goal is reached. The default goal is 100 drafts.
-- Review, schedule, or publish generated drafts from the Posts page.
+- Review, schedule, or publish generated drafts from the Planner page.
+
+## Planner
+
+- Planner -> Calendar shows all channels/groups for the next 30 days.
+- Each chat needs at least 5 scheduled posts per day.
+- Coverage is capped per day, so 10 posts on one day does not cover a missing day.
+- Planner -> Posts keeps the draft/scheduled/published list view.
 
 ## Telegram notes
 

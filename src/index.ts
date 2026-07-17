@@ -21,6 +21,8 @@ type Target = {
   rules: string;
   moderation_enabled: number;
   moderation_rules: string;
+  photo_file_id: string | null;
+  photo_updated_at: string | null;
   source: "manual" | "telegram";
   last_seen_at: string | null;
   created_at: string;
@@ -78,6 +80,21 @@ type TelegramChat = {
   username?: string;
   first_name?: string;
   last_name?: string;
+  photo?: TelegramChatPhoto;
+};
+
+type TelegramChatPhoto = {
+  small_file_id: string;
+  small_file_unique_id: string;
+  big_file_id: string;
+  big_file_unique_id: string;
+};
+
+type TelegramFile = {
+  file_id: string;
+  file_unique_id: string;
+  file_size?: number;
+  file_path?: string;
 };
 
 type TelegramUser = {
@@ -182,6 +199,9 @@ export default {
     if (url.pathname === "/api/targets" && request.method === "GET") return listTargets(env);
     if (url.pathname === "/api/targets" && request.method === "POST") return createTarget(request, env);
 
+    const targetPhotoMatch = url.pathname.match(/^\/api\/targets\/(\d+)\/photo$/);
+    if (targetPhotoMatch && request.method === "GET") return targetPhoto(Number(targetPhotoMatch[1]), env);
+
     const targetMatch = url.pathname.match(/^\/api\/targets\/(\d+)$/);
     if (targetMatch && request.method === "PATCH") return updateTarget(Number(targetMatch[1]), request, env);
     if (targetMatch && request.method === "DELETE") return deleteTarget(Number(targetMatch[1]), env);
@@ -267,14 +287,18 @@ async function upsertTargetFromChat(chat: TelegramChat, message: TelegramMessage
   const topicName = message?.forum_topic_created?.name ?? message?.forum_topic_edited?.name ?? null;
   const title = threadId > 0 ? `${baseTitle} / ${topicName ?? `Topic ${threadId}`}` : baseTitle;
   const type = chat.type === "channel" ? "channel" : "group";
+  const photoFileId = chat.photo?.small_file_id ?? null;
+  const photoUpdatedAt = photoFileId ? now : null;
 
   await env.DB.prepare(
-    `INSERT INTO targets (title, chat_id, thread_id, topic_name, type, moderation_enabled, moderation_rules, source, last_seen_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'telegram', ?)
+    `INSERT INTO targets (title, chat_id, thread_id, topic_name, type, moderation_enabled, moderation_rules, photo_file_id, photo_updated_at, source, last_seen_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'telegram', ?)
      ON CONFLICT(chat_id, thread_id) DO UPDATE SET
        title = excluded.title,
        topic_name = COALESCE(excluded.topic_name, targets.topic_name),
        type = excluded.type,
+       photo_file_id = COALESCE(excluded.photo_file_id, targets.photo_file_id),
+       photo_updated_at = COALESCE(excluded.photo_updated_at, targets.photo_updated_at),
        moderation_enabled = CASE WHEN excluded.type = 'group' THEN 1 ELSE targets.moderation_enabled END,
        moderation_rules = CASE
          WHEN excluded.type = 'group' AND targets.moderation_rules = '' THEN excluded.moderation_rules
@@ -282,7 +306,7 @@ async function upsertTargetFromChat(chat: TelegramChat, message: TelegramMessage
        END,
        source = 'telegram',
        last_seen_at = excluded.last_seen_at`
-  ).bind(title, chatId, threadId, topicName, type, type === "group" ? 1 : 0, DEFAULT_MODERATION_RULES, now).run();
+  ).bind(title, chatId, threadId, topicName, type, type === "group" ? 1 : 0, DEFAULT_MODERATION_RULES, photoFileId, photoUpdatedAt, now).run();
 
   const target = await env.DB.prepare("SELECT * FROM targets WHERE chat_id = ? AND thread_id = ?")
     .bind(chatId, threadId)
@@ -317,6 +341,65 @@ async function enforceAutomaticModerationSettings(env: Env): Promise<void> {
          moderation_rules = CASE WHEN moderation_rules = '' THEN ? ELSE moderation_rules END
      WHERE type = 'group'`
   ).bind(DEFAULT_MODERATION_RULES).run();
+}
+
+async function syncTargetProfiles(env: Env): Promise<void> {
+  const staleBefore = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const targets = await env.DB.prepare(
+    `SELECT id, chat_id, title, photo_updated_at
+     FROM targets
+     WHERE enabled = 1
+       AND thread_id = 0
+       AND (photo_updated_at IS NULL OR photo_updated_at < ?)
+     ORDER BY COALESCE(photo_updated_at, created_at) ASC
+     LIMIT 10`
+  ).bind(staleBefore).all<{ id: number; chat_id: string; title: string; photo_updated_at: string | null }>();
+
+  for (const target of targets.results ?? []) {
+    const chat = await telegramRequest<TelegramChat>(env, "getChat", { chat_id: target.chat_id });
+    const now = new Date().toISOString();
+    if (!chat.ok) {
+      await env.DB.prepare("UPDATE targets SET photo_updated_at = ? WHERE id = ?").bind(now, target.id).run();
+      continue;
+    }
+
+    await env.DB.prepare(
+      `UPDATE targets
+       SET title = COALESCE(?, title),
+           photo_file_id = ?,
+           photo_updated_at = ?
+       WHERE id = ?`
+    )
+      .bind(chat.result?.title ?? chat.result?.username ?? target.title, chat.result?.photo?.small_file_id ?? null, now, target.id)
+      .run();
+  }
+}
+
+async function targetPhoto(id: number, env: Env): Promise<Response> {
+  const target = await env.DB.prepare("SELECT photo_file_id FROM targets WHERE id = ? AND enabled = 1")
+    .bind(id)
+    .first<{ photo_file_id: string | null }>();
+  if (!target?.photo_file_id) return new Response(null, { status: 404 });
+
+  const file = await telegramRequest<TelegramFile>(env, "getFile", { file_id: target.photo_file_id });
+  if (!file.ok || !file.result?.file_path || !env.TELEGRAM_BOT_TOKEN) return new Response(null, { status: 404 });
+
+  const image = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${file.result.file_path}`);
+  if (!image.ok) return new Response(null, { status: 404 });
+
+  return new Response(image.body, {
+    headers: {
+      "content-type": inferTelegramFileContentType(file.result.file_path, image.headers.get("content-type")),
+      "cache-control": "public, max-age=3600"
+    }
+  });
+}
+
+function inferTelegramFileContentType(filePath: string, fallback: string | null): string {
+  if (/\.(jpe?g)$/i.test(filePath)) return "image/jpeg";
+  if (/\.png$/i.test(filePath)) return "image/png";
+  if (/\.webp$/i.test(filePath)) return "image/webp";
+  return fallback && fallback !== "application/octet-stream" ? fallback : "image/jpeg";
 }
 
 async function moderateTelegramMessage(env: Env, target: Target, message: TelegramMessage): Promise<void> {
@@ -430,10 +513,11 @@ function formatUsername(user: TelegramUser): string {
 
 async function listTargets(env: Env): Promise<Response> {
   await enforceAutomaticModerationSettings(env);
+  await syncTargetProfiles(env);
   await syncTargetMetrics(env);
 
   const targets = await env.DB.prepare(
-    `SELECT id, title, chat_id, thread_id, topic_name, type, enabled, rules, moderation_enabled, moderation_rules, source, last_seen_at, created_at
+    `SELECT id, title, chat_id, thread_id, topic_name, type, enabled, rules, moderation_enabled, moderation_rules, photo_file_id, photo_updated_at, source, last_seen_at, created_at
      FROM targets
      WHERE enabled = 1
      ORDER BY COALESCE(last_seen_at, created_at) DESC`
