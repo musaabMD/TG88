@@ -19,7 +19,6 @@ import {
   Trash2,
   TrendingDown,
   TrendingUp,
-  UserRound,
   Users,
   X
 } from "lucide-react";
@@ -828,7 +827,7 @@ function PostPage({
         <StatCard label="Members" value={totalMembers.toLocaleString()} sub={`${growth >= 0 ? "+" : ""}${growth.toFixed(1)}% this week · target ${GROWTH_TARGET}%`} icon={<Users className="w-3.5 h-3.5" />} />
         <StatCard label="Views" value={totalViews.toLocaleString()} sub="across published posts" icon={<Eye className="w-3.5 h-3.5" />} />
         <StatCard label="Published" value={String(published.length)} sub="posts live in Telegram" icon={<CheckCircle2 className="w-3.5 h-3.5" />} />
-        <StatCard label="Drafts" value={String(drafts.length)} sub="waiting on the Posts page" icon={<FileText className="w-3.5 h-3.5" />} />
+        <StatCard label="Drafts" value={String(drafts.length)} sub="waiting on the Planner page" icon={<FileText className="w-3.5 h-3.5" />} />
       </div>
 
       <Card className="p-4">
@@ -1071,58 +1070,146 @@ function PostsPage({
   );
 }
 
+function channelScheduleSummary(channel: Channel, posts: Post[]) {
+  const days = planDays();
+  const scheduled = posts.filter((post) => post.channelId === channel.id && post.status === "scheduled");
+  const counts = days.map((day) => scheduled.filter((post) => dateKey(new Date(post.scheduledAt)) === day.key).length);
+  const scheduledCount = counts.reduce((sum, count) => sum + count, 0);
+  const coveredDays = counts.filter((count) => count >= DAILY_PLAN_TARGET).length;
+  return {
+    scheduledCount,
+    coveredDays,
+    percent: planCoverage(counts),
+    missing: counts.reduce((sum, count) => sum + Math.max(0, DAILY_PLAN_TARGET - count), 0)
+  };
+}
+
+function interactionSummary(channel: Channel, posts: Post[]) {
+  const channelPosts = posts.filter((post) => post.channelId === channel.id);
+  const published = channelPosts.filter((post) => post.status === "published");
+  const views = published.reduce((sum, post) => sum + post.views, 0);
+  const members = Math.max(channel.members, 1);
+  const memberGrowth = weeklyGrowth(channel.memberHistory);
+  const viewGrowth = weeklyGrowth(channel.viewHistory);
+  const signal = channel.kind === "channel" ? views / members : (views + published.length) / members;
+  const level = channel.kind === "channel"
+    ? signal >= 1
+      ? "high"
+      : signal >= 0.25
+        ? "good"
+        : "bad"
+    : signal >= 0.1
+      ? "high"
+      : signal >= 0.02
+        ? "good"
+        : "bad";
+  const trendSource = viewGrowth !== 0 ? viewGrowth : memberGrowth;
+  const trend = trendSource > 0 ? "inc" : trendSource < 0 ? "down" : "flat";
+  const tone = level === "high" ? "emerald" : level === "good" ? "amber" : "red";
+
+  return {
+    level,
+    tone: tone as "emerald" | "amber" | "red",
+    trend,
+    views,
+    published: published.length,
+    rate: Math.round(signal * 1000) / 10
+  };
+}
+
 function ChannelsPage({ channels, posts, onOpenRules }: { channels: Channel[]; posts: Post[]; onOpenRules: (c: Channel) => void }) {
   return (
     <div className="space-y-4">
       <p className="text-xs text-slate-500">Use /register@dn88appbot in Telegram to add chats.</p>
-      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+      <div className="space-y-3">
         {channels.map((c) => {
           const mine = posts.filter((p) => p.channelId === c.id).length;
           const growth = weeklyGrowth(c.memberHistory);
+          const schedule = channelScheduleSummary(c, posts);
+          const interaction = interactionSummary(c, posts);
           return (
-            <Card key={c.id} className="p-5">
-              <div className="flex items-center justify-between gap-2">
+            <Card key={c.id} className="p-4">
+              <div className="grid grid-cols-1 xl:grid-cols-[minmax(280px,1.4fr)_minmax(210px,1fr)_minmax(230px,1fr)_minmax(170px,.8fr)_auto] gap-4 items-center">
                 <div className="flex items-center gap-3 min-w-0">
                   <ChannelAvatar channel={c} size="lg" />
-                  <div className="min-w-0">
-                    <p className="text-sm font-semibold text-slate-900 truncate">{c.name}</p>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <p className="text-sm font-semibold text-slate-900 truncate">{c.name}</p>
+                      <Badge tone="slate">{c.kind}</Badge>
+                    </div>
                     <p className="text-[11px] text-slate-400 truncate">{c.chatId}</p>
+                    <div className="flex flex-wrap items-center gap-1.5 mt-2">
+                      <Badge tone="sky">
+                        <Users className="w-3 h-3" />
+                        {c.members.toLocaleString()}
+                      </Badge>
+                      {c.kind === "group" && (
+                        <Badge tone="emerald">
+                          <Bot className="w-3 h-3" />
+                          Moderator auto
+                        </Badge>
+                      )}
+                    </div>
                   </div>
                 </div>
-                <Button size="sm" variant="outline" onClick={() => onOpenRules(c)}>
-                  <ScrollText className="w-3.5 h-3.5" />
-                  Rules
-                </Button>
-              </div>
 
-              <div className="mt-4">
-                <GrowthBar growth={growth} />
-              </div>
+                <div className="min-w-0">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-xs font-semibold text-slate-500">Schedule</p>
+                    <Badge tone={coverageTone(schedule.percent)}>{schedule.percent}%</Badge>
+                  </div>
+                  <p className="text-sm font-semibold text-slate-800 mt-1">
+                    {schedule.scheduledCount} content scheduled
+                  </p>
+                  <p className="text-[11px] text-slate-400">
+                    {schedule.coveredDays}/{PLAN_DAYS} days covered · {schedule.missing} missing
+                  </p>
+                </div>
 
-              <div className="flex flex-wrap items-center gap-2 mt-4">
-                <Badge tone="slate">{c.kind}</Badge>
-                <Badge tone="sky">
-                  <Users className="w-3 h-3" />
-                  {c.members.toLocaleString()} members
-                </Badge>
-                <Badge tone="emerald">
-                  <PenLine className="w-3 h-3" />
-                  {mine} by you
-                </Badge>
-                <Badge tone="violet">
-                  <UserRound className="w-3 h-3" />
-                  {c.memberPosts} by members
-                </Badge>
-                {c.kind === "group" && (
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <p className="text-xs font-semibold text-slate-500">Interaction</p>
+                    <Badge tone={interaction.tone}>
+                      {interaction.level}
+                      {interaction.trend === "inc" ? <TrendingUp className="w-3 h-3" /> : interaction.trend === "down" ? <TrendingDown className="w-3 h-3" /> : null}
+                      {interaction.trend}
+                    </Badge>
+                  </div>
+                  <p className="text-sm font-semibold text-slate-800 mt-1">
+                    {interaction.views.toLocaleString()} views · {interaction.published} posts
+                  </p>
+                  <p className="text-[11px] text-slate-400">
+                    {c.kind === "channel" ? "views/member" : "posts + views/member"} · {interaction.rate}%
+                  </p>
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-xs font-semibold text-slate-500">Growth</p>
+                    <span className={`inline-flex items-center gap-1 text-xs font-semibold ${growth >= GROWTH_TARGET ? "text-emerald-600" : "text-amber-600"}`}>
+                      {growth >= GROWTH_TARGET ? <TrendingUp className="w-3 h-3" /> : <TrendingDown className="w-3 h-3" />}
+                      {growth.toFixed(1)}%
+                    </span>
+                  </div>
+                  <div className="mt-2">
+                    <GrowthBar growth={growth} />
+                  </div>
+                </div>
+
+                <div className="flex xl:justify-end items-center gap-2">
                   <Badge tone="emerald">
-                    <Bot className="w-3 h-3" />
-                    Moderator auto
+                    <PenLine className="w-3 h-3" />
+                    {mine} by you
                   </Badge>
-                )}
-                <Badge tone={c.moderationActionCount > 0 ? "red" : "slate"}>
-                  <Trash2 className="w-3 h-3" />
-                  {c.moderationActionCount} actions
-                </Badge>
+                  <Badge tone={c.moderationActionCount > 0 ? "red" : "slate"}>
+                    <Trash2 className="w-3 h-3" />
+                    {c.moderationActionCount}
+                  </Badge>
+                  <Button size="sm" variant="outline" onClick={() => onOpenRules(c)}>
+                    <ScrollText className="w-3.5 h-3.5" />
+                    Rules
+                  </Button>
+                </div>
               </div>
             </Card>
           );
