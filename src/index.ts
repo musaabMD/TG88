@@ -214,6 +214,7 @@ export default {
   },
 
   async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
+    await enforceAutomaticModerationSettings(env);
     await postDueMessages(env);
     await syncTargetMetrics(env);
   }
@@ -274,6 +275,11 @@ async function upsertTargetFromChat(chat: TelegramChat, message: TelegramMessage
        title = excluded.title,
        topic_name = COALESCE(excluded.topic_name, targets.topic_name),
        type = excluded.type,
+       moderation_enabled = CASE WHEN excluded.type = 'group' THEN 1 ELSE targets.moderation_enabled END,
+       moderation_rules = CASE
+         WHEN excluded.type = 'group' AND targets.moderation_rules = '' THEN excluded.moderation_rules
+         ELSE targets.moderation_rules
+       END,
        source = 'telegram',
        last_seen_at = excluded.last_seen_at`
   ).bind(title, chatId, threadId, topicName, type, type === "group" ? 1 : 0, DEFAULT_MODERATION_RULES, now).run();
@@ -302,6 +308,15 @@ async function migrateChatId(env: Env, oldChatId: string, newChatId: string): Pr
   }
 
   await env.DB.prepare("UPDATE targets SET chat_id = ? WHERE chat_id = ?").bind(newChatId, oldChatId).run();
+}
+
+async function enforceAutomaticModerationSettings(env: Env): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE targets
+     SET moderation_enabled = 1,
+         moderation_rules = CASE WHEN moderation_rules = '' THEN ? ELSE moderation_rules END
+     WHERE type = 'group'`
+  ).bind(DEFAULT_MODERATION_RULES).run();
 }
 
 async function moderateTelegramMessage(env: Env, target: Target, message: TelegramMessage): Promise<void> {
@@ -414,6 +429,7 @@ function formatUsername(user: TelegramUser): string {
 }
 
 async function listTargets(env: Env): Promise<Response> {
+  await enforceAutomaticModerationSettings(env);
   await syncTargetMetrics(env);
 
   const targets = await env.DB.prepare(
@@ -509,26 +525,44 @@ async function createTarget(request: Request, env: Env): Promise<Response> {
   await env.DB.prepare(
     `INSERT INTO targets (title, chat_id, thread_id, type, moderation_enabled, moderation_rules)
      VALUES (?, ?, 0, ?, ?, ?)
-     ON CONFLICT(chat_id, thread_id) DO UPDATE SET title = excluded.title, type = excluded.type`
+     ON CONFLICT(chat_id, thread_id) DO UPDATE SET
+       title = excluded.title,
+       type = excluded.type,
+       moderation_enabled = CASE WHEN excluded.type = 'group' THEN 1 ELSE targets.moderation_enabled END,
+       moderation_rules = CASE
+         WHEN excluded.type = 'group' AND targets.moderation_rules = '' THEN excluded.moderation_rules
+         ELSE targets.moderation_rules
+       END`
   ).bind(title, chatId, type, type === "group" ? 1 : 0, DEFAULT_MODERATION_RULES).run();
 
   return listTargets(env);
 }
 
 async function updateTarget(id: number, request: Request, env: Env): Promise<Response> {
-  const input = await readJson<{ rules?: string; title?: string; moderationEnabled?: boolean; moderationRules?: string }>(request);
+  const input = await readJson<{ rules?: string; title?: string }>(request);
   const rules = cleanText(input.rules ?? "", 8000);
   const title = cleanText(input.title ?? "", 80);
-  const moderationEnabled = input.moderationEnabled === false ? 0 : 1;
-  const moderationRules = cleanText(input.moderationRules ?? DEFAULT_MODERATION_RULES, 8000) || DEFAULT_MODERATION_RULES;
 
   if (title) {
-    await env.DB.prepare("UPDATE targets SET title = ?, rules = ?, moderation_enabled = ?, moderation_rules = ? WHERE id = ?")
-      .bind(title, rules, moderationEnabled, moderationRules, id)
+    await env.DB.prepare(
+      `UPDATE targets
+       SET title = ?,
+           rules = ?,
+           moderation_enabled = CASE WHEN type = 'group' THEN 1 ELSE moderation_enabled END,
+           moderation_rules = CASE WHEN type = 'group' AND moderation_rules = '' THEN ? ELSE moderation_rules END
+       WHERE id = ?`
+    )
+      .bind(title, rules, DEFAULT_MODERATION_RULES, id)
       .run();
   } else {
-    await env.DB.prepare("UPDATE targets SET rules = ?, moderation_enabled = ?, moderation_rules = ? WHERE id = ?")
-      .bind(rules, moderationEnabled, moderationRules, id)
+    await env.DB.prepare(
+      `UPDATE targets
+       SET rules = ?,
+           moderation_enabled = CASE WHEN type = 'group' THEN 1 ELSE moderation_enabled END,
+           moderation_rules = CASE WHEN type = 'group' AND moderation_rules = '' THEN ? ELSE moderation_rules END
+       WHERE id = ?`
+    )
+      .bind(rules, DEFAULT_MODERATION_RULES, id)
       .run();
   }
 

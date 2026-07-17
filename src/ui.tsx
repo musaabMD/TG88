@@ -931,10 +931,12 @@ function ChannelsPage({ channels, posts, onOpenRules }: { channels: Channel[]; p
                   <UserRound className="w-3 h-3" />
                   {c.memberPosts} by members
                 </Badge>
-                <Badge tone={c.moderationEnabled ? "emerald" : "slate"}>
-                  <Bot className="w-3 h-3" />
-                  Moderator {c.moderationEnabled ? "on" : "off"}
-                </Badge>
+                {c.kind === "group" && (
+                  <Badge tone="emerald">
+                    <Bot className="w-3 h-3" />
+                    Moderator auto
+                  </Badge>
+                )}
                 <Badge tone={c.moderationActionCount > 0 ? "red" : "slate"}>
                   <Trash2 className="w-3 h-3" />
                   {c.moderationActionCount} actions
@@ -1068,17 +1070,13 @@ function RulesSheet({
 }: {
   channel: Channel | null;
   onClose: () => void;
-  onSave: (id: string, rules: string, moderationEnabled: boolean, moderationRules: string) => void;
+  onSave: (id: string, rules: string) => void;
 }) {
   const [value, setValue] = useState("");
-  const [moderationEnabled, setModerationEnabled] = useState(true);
-  const [moderationRules, setModerationRules] = useState("");
 
   useEffect(() => {
     if (channel) {
       setValue(channel.rules);
-      setModerationEnabled(channel.moderationEnabled);
-      setModerationRules(channel.moderationRules);
     }
   }, [channel]);
 
@@ -1109,20 +1107,21 @@ function RulesSheet({
             <p className="text-xs text-slate-400 mt-2">Rules apply to every AI draft for this chat.</p>
           </div>
 
-          <div className="rounded-lg border border-slate-200 p-4">
-            <label className="flex items-center justify-between gap-3">
+          <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4">
+            <div className="flex items-center justify-between gap-3">
               <span>
-                <span className="block text-sm font-semibold text-slate-800">Silent moderator</span>
-                <span className="block text-xs text-slate-500 mt-0.5">Delete and ban without replying in Telegram.</span>
+                <span className="block text-sm font-semibold text-emerald-900">Silent moderator automatic</span>
+                <span className="block text-xs text-emerald-700 mt-0.5">Group moderation is always on and self-heals if changed.</span>
               </span>
-              <input type="checkbox" checked={moderationEnabled} onChange={(e) => setModerationEnabled(e.target.checked)} className="w-4 h-4 accent-slate-900" />
-            </label>
+              <Badge tone="emerald">On</Badge>
+            </div>
           </div>
 
           <div>
-            <label className="text-xs font-medium text-slate-500">Moderation rules</label>
-            <textarea value={moderationRules} onChange={(e) => setModerationRules(e.target.value)} rows={8} placeholder="No spam, links, photo posts, external group invites, course promotion, or bot behavior." className="mt-2 w-full rounded-lg border border-slate-300 p-3 text-sm text-slate-800 focus:outline-2 focus:outline-sky-500 resize-none" />
-            <p className="text-xs text-slate-400 mt-2">The webhook enforces blocked links, photos, bot senders, bot joins, and promotion/invite language.</p>
+            <div className="text-xs font-medium text-slate-500">Automatic moderation policy</div>
+            <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700 whitespace-pre-wrap">
+              {channel.moderationRules}
+            </div>
           </div>
 
           {channel.moderationActions.length > 0 && (
@@ -1154,7 +1153,7 @@ function RulesSheet({
           </Button>
           <Button
             onClick={() => {
-              onSave(channel.id, value, moderationEnabled, moderationRules);
+              onSave(channel.id, value);
               onClose();
             }}
           >
@@ -1237,10 +1236,10 @@ function TG88Dashboard() {
     notify(`Deleted ${ids.length} post${ids.length === 1 ? "" : "s"}`);
   };
 
-  const saveRules = async (id: string, rules: string, moderationEnabled: boolean, moderationRules: string) => {
+  const saveRules = async (id: string, rules: string) => {
     await api(`/api/targets/${id}`, {
       method: "PATCH",
-      body: JSON.stringify({ rules, moderationEnabled, moderationRules })
+      body: JSON.stringify({ rules })
     });
     await load();
     notify("Rules saved");

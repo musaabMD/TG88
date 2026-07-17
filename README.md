@@ -105,7 +105,7 @@ npm run dev
 
 ## Moderator rules
 
-Group moderation is enabled by default for registered groups and can be changed from Channels & groups -> Rules.
+Group moderation is automatic for registered groups. The app keeps it enabled and applies the default policy without manual rule setup.
 
 The webhook silently deletes the message and bans the sender when it sees:
 
@@ -115,3 +115,5 @@ The webhook silently deletes the message and bans the sender when it sees:
 - Promotion or invite language for other courses, channels, groups, communities, or websites.
 
 The bot does not reply with warnings. Recent delete/ban results are logged in the app.
+
+Telegram still requires the group owner to grant the bot admin permissions and to disable privacy mode in BotFather when full-message inspection is needed; those controls are not exposed to bots through the Bot API.
