@@ -9,7 +9,6 @@ import {
   CheckCircle2,
   CornerDownLeft,
   Eye,
-  FileText,
   LineChart as LineChartIcon,
   MessagesSquare,
   PenLine,
@@ -814,38 +813,16 @@ function StatCard({ label, value, sub, icon }: { label: string; value: string; s
 
 function PostPage({
   channels,
-  posts,
   onGenerated,
   notify
 }: {
   channels: Channel[];
-  posts: Post[];
   onGenerated: () => Promise<void>;
   notify: (message: string) => void;
 }) {
-  const totalMembers = channels.reduce((s, c) => s + c.members, 0);
-  const overallHistory = channels.length
-    ? channels[0].memberHistory.map((_, i) => channels.reduce((s, c) => s + (c.memberHistory[i] ?? 0), 0))
-    : Array(8).fill(0);
-  const growth = weeklyGrowth(overallHistory);
-  const published = posts.filter((p) => p.status === "published");
-  const drafts = posts.filter((p) => p.status === "draft");
-  const totalViews = published.reduce((s, p) => s + p.views, 0);
-
   return (
-    <div className="space-y-5">
+    <div>
       <AiGenerator channels={channels} onGenerated={onGenerated} notify={notify} />
-
-      <div className="grid grid-cols-2 xl:grid-cols-4 gap-4">
-        <StatCard label="Members" value={totalMembers.toLocaleString()} sub={`${growth >= 0 ? "+" : ""}${growth.toFixed(1)}% this week · target ${GROWTH_TARGET}%`} icon={<Users className="w-3.5 h-3.5" />} />
-        <StatCard label="Views" value={totalViews.toLocaleString()} sub="across published posts" icon={<Eye className="w-3.5 h-3.5" />} />
-        <StatCard label="Published" value={String(published.length)} sub="posts live in Telegram" icon={<CheckCircle2 className="w-3.5 h-3.5" />} />
-        <StatCard label="Drafts" value={String(drafts.length)} sub="waiting on the Planner page" icon={<FileText className="w-3.5 h-3.5" />} />
-      </div>
-
-      <Card className="p-4">
-        <GrowthBar growth={growth} />
-      </Card>
     </div>
   );
 }
@@ -1593,7 +1570,7 @@ function TG88Dashboard() {
         <main className="p-6 w-full">
           {loading && <Card className="p-10 text-center text-sm text-slate-500">Loading TG88...</Card>}
           {!loading && channels.length === 0 && <Card className="p-10 text-center text-sm text-slate-500">Use /register@dn88appbot in Telegram to add chats.</Card>}
-          {!loading && channels.length > 0 && page === "post" && <PostPage channels={channels} posts={posts} onGenerated={load} notify={notify} />}
+          {!loading && channels.length > 0 && page === "post" && <PostPage channels={channels} onGenerated={load} notify={notify} />}
           {!loading && channels.length > 0 && page === "posts" && <PostsPage posts={posts} channels={channels} onPublish={publishPosts} onDelete={deletePosts} />}
           {!loading && channels.length > 0 && page === "channels" && <ChannelsPage channels={channels} posts={posts} onOpenRules={setRulesFor} />}
           {!loading && channels.length > 0 && page === "analytics" && <AnalyticsPage channels={channels} />}
