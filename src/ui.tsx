@@ -47,6 +47,10 @@ interface ApiTarget {
   title: string;
   type: ChannelKind;
   rules: string;
+  moderation_enabled: number;
+  moderation_rules: string;
+  moderation_action_count?: number;
+  moderation_actions?: ApiModerationAction[];
   post_count?: number;
   draft_count?: number;
   published_count?: number;
@@ -58,6 +62,18 @@ interface ApiTarget {
   member_history?: number[];
   view_history?: number[];
   messages?: ApiMessage[];
+}
+
+interface ApiModerationAction {
+  id: number;
+  reason: string;
+  username: string | null;
+  user_id: string;
+  excerpt: string | null;
+  delete_ok: number;
+  ban_ok: number;
+  error: string | null;
+  created_at: string;
 }
 
 interface ApiMessage {
@@ -84,6 +100,10 @@ interface Channel {
   members: number;
   memberPosts: number;
   rules: string;
+  moderationEnabled: boolean;
+  moderationRules: string;
+  moderationActionCount: number;
+  moderationActions: ApiModerationAction[];
   color: string;
   memberHistory: number[];
   viewHistory: number[];
@@ -253,6 +273,10 @@ function mapData(targets: ApiTarget[]): { channels: Channel[]; posts: Post[] } {
     members: target.member_count ?? 0,
     memberPosts: 0,
     rules: target.rules ?? "",
+    moderationEnabled: target.moderation_enabled === 1,
+    moderationRules: target.moderation_rules ?? "",
+    moderationActionCount: target.moderation_action_count ?? 0,
+    moderationActions: target.moderation_actions ?? [],
     color: COLORS[index % COLORS.length],
     memberHistory: normalizeHistory(target.member_history, target.member_count ?? 0),
     viewHistory: normalizeHistory(target.view_history, target.view_count ?? 0)
@@ -907,6 +931,14 @@ function ChannelsPage({ channels, posts, onOpenRules }: { channels: Channel[]; p
                   <UserRound className="w-3 h-3" />
                   {c.memberPosts} by members
                 </Badge>
+                <Badge tone={c.moderationEnabled ? "emerald" : "slate"}>
+                  <Bot className="w-3 h-3" />
+                  Moderator {c.moderationEnabled ? "on" : "off"}
+                </Badge>
+                <Badge tone={c.moderationActionCount > 0 ? "red" : "slate"}>
+                  <Trash2 className="w-3 h-3" />
+                  {c.moderationActionCount} actions
+                </Badge>
               </div>
             </Card>
           );
@@ -1036,12 +1068,18 @@ function RulesSheet({
 }: {
   channel: Channel | null;
   onClose: () => void;
-  onSave: (id: string, rules: string) => void;
+  onSave: (id: string, rules: string, moderationEnabled: boolean, moderationRules: string) => void;
 }) {
   const [value, setValue] = useState("");
+  const [moderationEnabled, setModerationEnabled] = useState(true);
+  const [moderationRules, setModerationRules] = useState("");
 
   useEffect(() => {
-    if (channel) setValue(channel.rules);
+    if (channel) {
+      setValue(channel.rules);
+      setModerationEnabled(channel.moderationEnabled);
+      setModerationRules(channel.moderationRules);
+    }
   }, [channel]);
 
   if (!channel) return null;
@@ -1064,10 +1102,51 @@ function RulesSheet({
             <X className="w-4 h-4" />
           </button>
         </div>
-        <div className="p-5 flex-1 overflow-y-auto">
-          <label className="text-xs font-medium text-slate-500">Tone, notes, links to avoid</label>
-          <textarea value={value} onChange={(e) => setValue(e.target.value)} rows={10} placeholder="Example: friendly tone, no external shorteners, tag releases with #changelog" className="mt-2 w-full rounded-lg border border-slate-300 p-3 text-sm text-slate-800 focus:outline-2 focus:outline-sky-500 resize-none" />
-          <p className="text-xs text-slate-400 mt-2">Rules apply to every post drafted for this chat.</p>
+        <div className="p-5 flex-1 overflow-y-auto space-y-5">
+          <div>
+            <label className="text-xs font-medium text-slate-500">Tone, notes, links to avoid</label>
+            <textarea value={value} onChange={(e) => setValue(e.target.value)} rows={7} placeholder="Example: friendly tone, no external shorteners, tag releases with #changelog" className="mt-2 w-full rounded-lg border border-slate-300 p-3 text-sm text-slate-800 focus:outline-2 focus:outline-sky-500 resize-none" />
+            <p className="text-xs text-slate-400 mt-2">Rules apply to every AI draft for this chat.</p>
+          </div>
+
+          <div className="rounded-lg border border-slate-200 p-4">
+            <label className="flex items-center justify-between gap-3">
+              <span>
+                <span className="block text-sm font-semibold text-slate-800">Silent moderator</span>
+                <span className="block text-xs text-slate-500 mt-0.5">Delete and ban without replying in Telegram.</span>
+              </span>
+              <input type="checkbox" checked={moderationEnabled} onChange={(e) => setModerationEnabled(e.target.checked)} className="w-4 h-4 accent-slate-900" />
+            </label>
+          </div>
+
+          <div>
+            <label className="text-xs font-medium text-slate-500">Moderation rules</label>
+            <textarea value={moderationRules} onChange={(e) => setModerationRules(e.target.value)} rows={8} placeholder="No spam, links, photo posts, external group invites, course promotion, or bot behavior." className="mt-2 w-full rounded-lg border border-slate-300 p-3 text-sm text-slate-800 focus:outline-2 focus:outline-sky-500 resize-none" />
+            <p className="text-xs text-slate-400 mt-2">The webhook enforces blocked links, photos, bot senders, bot joins, and promotion/invite language.</p>
+          </div>
+
+          {channel.moderationActions.length > 0 && (
+            <div>
+              <div className="text-xs font-medium text-slate-500 mb-2">Recent actions</div>
+              <div className="space-y-2">
+                {channel.moderationActions.slice(0, 6).map((action) => (
+                  <div key={action.id} className="rounded-lg border border-slate-200 p-3">
+                    <div className="flex items-center justify-between gap-2 text-xs">
+                      <span className="font-semibold text-slate-700 truncate">{action.username || action.user_id}</span>
+                      <span className="text-slate-400 whitespace-nowrap">{fmtTime(action.created_at)}</span>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-1.5 mt-2">
+                      <Badge tone="red">{action.reason.replaceAll("_", " ")}</Badge>
+                      <Badge tone={action.delete_ok ? "emerald" : "amber"}>delete {action.delete_ok ? "ok" : "failed"}</Badge>
+                      <Badge tone={action.ban_ok ? "emerald" : "amber"}>ban {action.ban_ok ? "ok" : "failed"}</Badge>
+                    </div>
+                    {action.excerpt && <p className="text-xs text-slate-500 mt-2 line-clamp-2">{action.excerpt}</p>}
+                    {action.error && <p className="text-xs text-red-500 mt-2 line-clamp-2">{action.error}</p>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
         <div className="p-5 border-t border-slate-100 flex justify-end gap-2">
           <Button variant="outline" onClick={onClose}>
@@ -1075,7 +1154,7 @@ function RulesSheet({
           </Button>
           <Button
             onClick={() => {
-              onSave(channel.id, value);
+              onSave(channel.id, value, moderationEnabled, moderationRules);
               onClose();
             }}
           >
@@ -1158,10 +1237,10 @@ function TG88Dashboard() {
     notify(`Deleted ${ids.length} post${ids.length === 1 ? "" : "s"}`);
   };
 
-  const saveRules = async (id: string, rules: string) => {
+  const saveRules = async (id: string, rules: string, moderationEnabled: boolean, moderationRules: string) => {
     await api(`/api/targets/${id}`, {
       method: "PATCH",
-      body: JSON.stringify({ rules })
+      body: JSON.stringify({ rules, moderationEnabled, moderationRules })
     });
     await load();
     notify("Rules saved");

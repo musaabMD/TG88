@@ -19,10 +19,14 @@ type Target = {
   type: "channel" | "group";
   enabled: number;
   rules: string;
+  moderation_enabled: number;
+  moderation_rules: string;
   source: "manual" | "telegram";
   last_seen_at: string | null;
   created_at: string;
   messages?: ScheduledMessage[];
+  moderation_actions?: ModerationAction[];
+  moderation_action_count?: number;
   post_count?: number;
   draft_count?: number;
   scheduled_count?: number;
@@ -76,11 +80,32 @@ type TelegramChat = {
   last_name?: string;
 };
 
+type TelegramUser = {
+  id: number;
+  is_bot: boolean;
+  first_name?: string;
+  last_name?: string;
+  username?: string;
+};
+
+type TelegramMessageEntity = {
+  type: string;
+  offset: number;
+  length: number;
+  url?: string;
+};
+
 type TelegramMessage = {
   message_id: number;
   text?: string;
+  caption?: string;
   chat: TelegramChat;
+  from?: TelegramUser;
   message_thread_id?: number;
+  entities?: TelegramMessageEntity[];
+  caption_entities?: TelegramMessageEntity[];
+  photo?: unknown[];
+  new_chat_members?: TelegramUser[];
   forum_topic_created?: { name: string };
   forum_topic_edited?: { name?: string };
   migrate_to_chat_id?: number;
@@ -115,10 +140,34 @@ type AiGeneration = {
   updated_at: string;
 };
 
+type ModerationAction = {
+  id: number;
+  target_id: number | null;
+  chat_id: string;
+  user_id: string;
+  username: string | null;
+  message_id: number | null;
+  reason: string;
+  excerpt: string | null;
+  delete_ok: number;
+  ban_ok: number;
+  error: string | null;
+  created_at: string;
+};
+
 const jsonHeaders = {
   "content-type": "application/json; charset=utf-8",
   "cache-control": "no-store"
 };
+
+const DEFAULT_MODERATION_RULES = [
+  "No spam.",
+  "No promotion for other courses, channels, groups, websites, or communities.",
+  "No Telegram invite links or external links unless posted by this bot.",
+  "No photos from members.",
+  "Any bot account posting in the group is removed.",
+  "Violations are deleted and the sender is banned silently."
+].join("\n");
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -201,8 +250,10 @@ async function telegramWebhook(request: Request, env: Env): Promise<Response> {
     };
     if (target.thread_id > 0) payload.message_thread_id = target.thread_id;
     await telegramRequest(env, "sendMessage", payload);
+    return json({ ok: true });
   }
 
+  if (sourceMessage && update.message) await moderateTelegramMessage(env, target, sourceMessage);
   return json({ ok: true });
 }
 
@@ -217,15 +268,15 @@ async function upsertTargetFromChat(chat: TelegramChat, message: TelegramMessage
   const type = chat.type === "channel" ? "channel" : "group";
 
   await env.DB.prepare(
-    `INSERT INTO targets (title, chat_id, thread_id, topic_name, type, source, last_seen_at)
-     VALUES (?, ?, ?, ?, ?, 'telegram', ?)
+    `INSERT INTO targets (title, chat_id, thread_id, topic_name, type, moderation_enabled, moderation_rules, source, last_seen_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'telegram', ?)
      ON CONFLICT(chat_id, thread_id) DO UPDATE SET
        title = excluded.title,
        topic_name = COALESCE(excluded.topic_name, targets.topic_name),
        type = excluded.type,
        source = 'telegram',
        last_seen_at = excluded.last_seen_at`
-  ).bind(title, chatId, threadId, topicName, type, now).run();
+  ).bind(title, chatId, threadId, topicName, type, type === "group" ? 1 : 0, DEFAULT_MODERATION_RULES, now).run();
 
   const target = await env.DB.prepare("SELECT * FROM targets WHERE chat_id = ? AND thread_id = ?")
     .bind(chatId, threadId)
@@ -253,11 +304,120 @@ async function migrateChatId(env: Env, oldChatId: string, newChatId: string): Pr
   await env.DB.prepare("UPDATE targets SET chat_id = ? WHERE chat_id = ?").bind(newChatId, oldChatId).run();
 }
 
+async function moderateTelegramMessage(env: Env, target: Target, message: TelegramMessage): Promise<void> {
+  if (target.type !== "group" || target.moderation_enabled !== 1) return;
+
+  for (const member of message.new_chat_members ?? []) {
+    if (member.is_bot) {
+      await enforceModeration(env, target, message, member, "bot_joined_group", "New bot account joined the group");
+    }
+  }
+
+  if (!message.from) return;
+  const check = classifyModerationViolation(message);
+  if (!check) return;
+  await enforceModeration(env, target, message, message.from, check.reason, check.excerpt);
+}
+
+function classifyModerationViolation(message: TelegramMessage): { reason: string; excerpt: string } | null {
+  const text = extractMessageText(message);
+  const excerpt = cleanText(text, 500);
+
+  if (message.from?.is_bot) return { reason: "bot_sender", excerpt: excerpt || "Bot account posted in group" };
+  if ((message.photo?.length ?? 0) > 0) return { reason: "photo_posted", excerpt: excerpt || "Photo message" };
+  if (hasUrlEntity(message) || hasBlockedLink(text)) return { reason: "blocked_link", excerpt };
+  if (hasPromotionText(text)) return { reason: "promotion_or_invite", excerpt };
+
+  return null;
+}
+
+async function enforceModeration(
+  env: Env,
+  target: Target,
+  message: TelegramMessage,
+  user: TelegramUser,
+  reason: string,
+  excerpt: string
+): Promise<void> {
+  const chatId = String(message.chat.id);
+  const userId = String(user.id);
+  let deleteOk = false;
+  let banOk = false;
+  const errors: string[] = [];
+
+  const deleteResult = await telegramRequest<boolean>(env, "deleteMessage", {
+    chat_id: chatId,
+    message_id: message.message_id
+  });
+  deleteOk = deleteResult.ok === true;
+  if (!deleteResult.ok && deleteResult.description) errors.push(`delete: ${deleteResult.description}`);
+
+  const banResult = await telegramRequest<boolean>(env, "banChatMember", {
+    chat_id: chatId,
+    user_id: user.id,
+    revoke_messages: true
+  });
+  banOk = banResult.ok === true;
+  if (!banResult.ok && banResult.description) errors.push(`ban: ${banResult.description}`);
+
+  await env.DB.prepare(
+    `INSERT INTO moderation_actions (
+      target_id,
+      chat_id,
+      user_id,
+      username,
+      message_id,
+      reason,
+      excerpt,
+      delete_ok,
+      ban_ok,
+      error
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      target.id,
+      chatId,
+      userId,
+      formatUsername(user),
+      message.message_id,
+      reason,
+      cleanText(excerpt, 500),
+      deleteOk ? 1 : 0,
+      banOk ? 1 : 0,
+      errors.length > 0 ? errors.join("; ") : null
+    )
+    .run();
+}
+
+function extractMessageText(message: TelegramMessage): string {
+  return [message.text, message.caption].filter(Boolean).join("\n");
+}
+
+function hasUrlEntity(message: TelegramMessage): boolean {
+  return [...(message.entities ?? []), ...(message.caption_entities ?? [])].some((entity) =>
+    entity.type === "url" || entity.type === "text_link" || Boolean(entity.url)
+  );
+}
+
+function hasBlockedLink(text: string): boolean {
+  return /(?:https?:\/\/|www\.|t\.me\/|telegram\.me\/|telegram\.dog\/|tg:\/\/|chat\.whatsapp\.com\/|wa\.me\/|discord\.gg\/|bit\.ly\/|linktr\.ee\/)/i.test(text);
+}
+
+function hasPromotionText(text: string): boolean {
+  return /(?:(?:join|subscribe|follow|visit|check out|dm me|message me|contact me|invite).{0,50}(?:course|class|signals?|community|channel|group|site|website|telegram|whatsapp)|(?:course|class|signals?).{0,50}(?:join|subscribe|dm|contact|link|group|channel)|(?:اشترك|تابع|انضم|راسلني).{0,50}(?:دورة|كورس|قروب|مجموعة|قناة|رابط))/i.test(text);
+}
+
+function formatUsername(user: TelegramUser): string {
+  const handle = user.username ? `@${user.username}` : "";
+  const name = [user.first_name, user.last_name].filter(Boolean).join(" ");
+  return handle || name || String(user.id);
+}
+
 async function listTargets(env: Env): Promise<Response> {
   await syncTargetMetrics(env);
 
   const targets = await env.DB.prepare(
-    `SELECT id, title, chat_id, thread_id, topic_name, type, enabled, rules, source, last_seen_at, created_at
+    `SELECT id, title, chat_id, thread_id, topic_name, type, enabled, rules, moderation_enabled, moderation_rules, source, last_seen_at, created_at
      FROM targets
      WHERE enabled = 1
      ORDER BY COALESCE(last_seen_at, created_at) DESC`
@@ -275,6 +435,13 @@ async function listTargets(env: Env): Promise<Response> {
     "SELECT target_id, member_count, view_count, captured_at FROM target_metrics ORDER BY captured_at DESC"
   ).all<TargetMetric>();
 
+  const moderationActions = await env.DB.prepare(
+    `SELECT *
+     FROM moderation_actions
+     ORDER BY created_at DESC
+     LIMIT 200`
+  ).all<ModerationAction>();
+
   const messagesByTarget = new Map<number, ScheduledMessage[]>();
   for (const message of messages.results ?? []) {
     const list = messagesByTarget.get(message.target_id) ?? [];
@@ -289,12 +456,21 @@ async function listTargets(env: Env): Promise<Response> {
     metricsByTarget.set(metric.target_id, list);
   }
 
+  const moderationByTarget = new Map<number, ModerationAction[]>();
+  for (const action of moderationActions.results ?? []) {
+    if (!action.target_id) continue;
+    const list = moderationByTarget.get(action.target_id) ?? [];
+    list.push(action);
+    moderationByTarget.set(action.target_id, list);
+  }
+
   const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
 
   return json({
     targets: (targets.results ?? []).map((target) => {
       const targetMessages = messagesByTarget.get(target.id) ?? [];
       const targetMetrics = metricsByTarget.get(target.id) ?? [];
+      const targetActions = moderationByTarget.get(target.id) ?? [];
       const latest = targetMetrics[0];
       const previous = targetMetrics.find((metric) => new Date(metric.captured_at).getTime() <= weekAgo);
       const memberHistory = buildHistory(targetMetrics, "member_count");
@@ -303,6 +479,9 @@ async function listTargets(env: Env): Promise<Response> {
       return {
         ...target,
         messages: targetMessages,
+        moderation_rules: target.moderation_rules || DEFAULT_MODERATION_RULES,
+        moderation_actions: targetActions.slice(0, 20),
+        moderation_action_count: targetActions.length,
         post_count: targetMessages.filter((message) => message.status !== "draft").length,
         draft_count: targetMessages.filter((message) => message.status === "draft").length,
         scheduled_count: targetMessages.filter((message) => message.status === "pending" || message.status === "posting").length,
@@ -328,23 +507,29 @@ async function createTarget(request: Request, env: Env): Promise<Response> {
   if (!title || !chatId) return json({ error: "Title and chat ID are required" }, 400);
 
   await env.DB.prepare(
-    `INSERT INTO targets (title, chat_id, thread_id, type)
-     VALUES (?, ?, 0, ?)
+    `INSERT INTO targets (title, chat_id, thread_id, type, moderation_enabled, moderation_rules)
+     VALUES (?, ?, 0, ?, ?, ?)
      ON CONFLICT(chat_id, thread_id) DO UPDATE SET title = excluded.title, type = excluded.type`
-  ).bind(title, chatId, type).run();
+  ).bind(title, chatId, type, type === "group" ? 1 : 0, DEFAULT_MODERATION_RULES).run();
 
   return listTargets(env);
 }
 
 async function updateTarget(id: number, request: Request, env: Env): Promise<Response> {
-  const input = await readJson<{ rules?: string; title?: string }>(request);
+  const input = await readJson<{ rules?: string; title?: string; moderationEnabled?: boolean; moderationRules?: string }>(request);
   const rules = cleanText(input.rules ?? "", 8000);
   const title = cleanText(input.title ?? "", 80);
+  const moderationEnabled = input.moderationEnabled === false ? 0 : 1;
+  const moderationRules = cleanText(input.moderationRules ?? DEFAULT_MODERATION_RULES, 8000) || DEFAULT_MODERATION_RULES;
 
   if (title) {
-    await env.DB.prepare("UPDATE targets SET title = ?, rules = ? WHERE id = ?").bind(title, rules, id).run();
+    await env.DB.prepare("UPDATE targets SET title = ?, rules = ?, moderation_enabled = ?, moderation_rules = ? WHERE id = ?")
+      .bind(title, rules, moderationEnabled, moderationRules, id)
+      .run();
   } else {
-    await env.DB.prepare("UPDATE targets SET rules = ? WHERE id = ?").bind(rules, id).run();
+    await env.DB.prepare("UPDATE targets SET rules = ?, moderation_enabled = ?, moderation_rules = ? WHERE id = ?")
+      .bind(rules, moderationEnabled, moderationRules, id)
+      .run();
   }
 
   return listTargets(env);
@@ -803,7 +988,7 @@ async function getTargetsByIds(env: Env, targetIds: number[]): Promise<Target[]>
   if (targetIds.length === 0) return [];
   const placeholders = targetIds.map(() => "?").join(",");
   const targets = await env.DB.prepare(
-    `SELECT id, title, chat_id, thread_id, topic_name, type, enabled, rules, source, last_seen_at, created_at
+    `SELECT id, title, chat_id, thread_id, topic_name, type, enabled, rules, moderation_enabled, moderation_rules, source, last_seen_at, created_at
      FROM targets
      WHERE enabled = 1 AND id IN (${placeholders})`
   ).bind(...targetIds).all<Target>();
